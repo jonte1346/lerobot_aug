@@ -1,620 +1,347 @@
-"""Main CLI pipeline for ALOHA dataset augmentation (LeRobot v3 format)."""
+"""LeRobot v3 dataset augmentation CLI."""
 
 from __future__ import annotations
 
-import json
-import random
-import shutil
-import subprocess
-import tempfile
+import argparse
+import time
 from pathlib import Path
-from typing import Any
+from urllib.parse import quote
 
-import fire
 import numpy as np
-import pandas as pd
-from rich.console import Console
-from rich.table import Table
+import torch
+from tqdm import tqdm
+from torchvision.transforms import v2
 
-from aloha_augment.prefilter import score_sparc, score_actuator_saturation
-from aloha_augment.visual_aug import apply_color_jitter, apply_occlusion_patch
-from aloha_augment.upload import upload_dataset
-
-console = Console()
+from .transforms import DriftingBlob, FrameDecimator, HorizontalFlipWithActionMirror, ROBOT_PRESETS, StaticErasing
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _load_dataset(repo_id: str):
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    return LeRobotDataset(repo_id, video_backend="pyav")
-
-
-def _status_markup(status: str) -> str:
-    colours = {"PASS": "green", "WARN": "yellow", "FAIL": "red", "N/A": "dim"}
-    colour = colours.get(status, "white")
-    return f"[{colour}]{status}[/{colour}]"
-
-
-def _pass_warn_fail(val, pass_thresh, warn_thresh, higher_is_better=True) -> str:
-    if val is None or (isinstance(val, float) and val != val):
-        return "N/A"
-    if higher_is_better:
-        if val >= pass_thresh:
-            return "PASS"
-        elif val >= warn_thresh:
-            return "WARN"
-        return "FAIL"
-    else:
-        if val <= pass_thresh:
-            return "PASS"
-        elif val <= warn_thresh:
-            return "WARN"
-        return "FAIL"
-
-
-def _get_camera_keys(info: dict) -> list[str]:
-    """Return camera feature keys (those with dtype == 'video') from info.json."""
-    features = info.get("features", {})
-    cam_keys = [k for k, v in features.items() if isinstance(v, dict) and v.get("dtype") == "video"]
-    return cam_keys
-
-
-def _get_fps(info: dict) -> float:
-    return float(info.get("fps", 50.0))
-
-
-def _read_info_json(dataset_root: Path) -> dict:
-    info_path = dataset_root / "meta" / "info.json"
-    with open(info_path) as f:
-        return json.load(f)
-
-
-def _open_video_pyav(src_video: Path):
-    """Open a video with pyav, returning (container, stream). Falls back to h264 temp file."""
-    try:
-        import av
-        container = av.open(str(src_video))
-        stream = container.streams.video[0]
-        stream.codec_context.thread_type = "AUTO"
-        return container, stream, None  # (container, stream, tmp_path)
-    except Exception:
-        pass
-
-    # Fall back: transcode via ffmpeg to h264 temp file
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp.close()
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", str(src_video),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            tmp.name,
-        ],
-        capture_output=True,
-        check=True,
+def build_color_jitter(args):
+    return v2.ColorJitter(
+        brightness=tuple(args.brightness),
+        contrast=tuple(args.contrast),
+        saturation=tuple(args.saturation),
+        hue=tuple(args.hue),
     )
-    import av
-    container = av.open(tmp.name)
-    stream = container.streams.video[0]
-    stream.codec_context.thread_type = "AUTO"
-    return container, stream, Path(tmp.name)
 
 
-def _episode_arrays_from_parquet(src_df: pd.DataFrame, episode_idx: int):
-    """Build state_list and actions array for one episode from the flat parquet."""
-    ep_df = src_df[src_df["episode_index"] == episode_idx].sort_values("frame_index")
-    if ep_df.empty:
-        return [], np.empty((0,))
-
-    state_col = "observation.state"
-    action_col = "action"
-
-    if state_col not in ep_df.columns or action_col not in ep_df.columns:
-        # Try to find columns by partial match
-        state_cols = [c for c in ep_df.columns if "state" in c.lower()]
-        action_cols = [c for c in ep_df.columns if "action" in c.lower()]
-        state_col = state_cols[0] if state_cols else None
-        action_col = action_cols[0] if action_cols else None
-
-    state_list = []
-    action_rows = []
-    for _, row in ep_df.iterrows():
-        if state_col and state_col in row.index:
-            q = np.array(row[state_col], dtype=float)
-        else:
-            q = np.zeros(6, dtype=float)
-        state_list.append({"q": q})
-        if action_col and action_col in ep_df.columns:
-            action_rows.append(np.array(row[action_col], dtype=float))
-        else:
-            action_rows.append(np.zeros(6, dtype=float))
-
-    actions = np.stack(action_rows) if action_rows else np.empty((0,))
-    return state_list, actions
+def build_gaussian_blur(args):
+    return v2.GaussianBlur(kernel_size=args.blur_kernel, sigma=tuple(args.blur_sigma))
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 helper: process one camera for all copies
-# ---------------------------------------------------------------------------
+def build_sharpness(args):
+    return v2.RandomAdjustSharpness(sharpness_factor=args.sharpness_factor, p=1.0)
 
-def _process_camera(
-    src_video: Path,
-    cam_key: str,
-    good_indices: list[int],
-    frames_per_episode: int,
-    n_aug_copies: int,
-    fps: float,
-    output_dataset_dir: Path,
-    seed: int,
-) -> None:
-    """Read src_video once per aug copy, write filtered+augmented output videos."""
-    import av
-    import cv2
 
-    for c in range(n_aug_copies):
-        dst = output_dataset_dir / "videos" / cam_key / f"chunk-{c:03d}" / "file-000.mp4"
-        dst.parent.mkdir(parents=True, exist_ok=True)
+def build_random_erasing(args):
+    return v2.RandomErasing(p=args.erasing_p, scale=tuple(args.erasing_scale))
 
-        rng = random.Random(seed + c)
 
-        good_set = set(good_indices)
+def build_static_erasing(args):
+    return StaticErasing(scale=tuple(args.erasing_scale))
 
-        # Open source video
-        container, stream, tmp_path = _open_video_pyav(src_video)
 
-        # We need width/height — peek at first decodable frame
-        width = stream.codec_context.width
-        height = stream.codec_context.height
-        if width == 0 or height == 0:
-            # Decode one frame to get size
-            for packet in container.demux(stream):
-                for frame in packet.decode():
-                    arr = frame.to_ndarray(format="bgr24")
-                    height, width = arr.shape[:2]
-                    break
-                if width != 0:
-                    break
-            container.seek(0)
-            container, stream, tmp_path2 = _open_video_pyav(src_video)
-            if tmp_path2 is not None:
-                if tmp_path is not None:
-                    tmp_path.unlink(missing_ok=True)
-                tmp_path = tmp_path2
+def build_frame_decimate(args):
+    return FrameDecimator(remove_every_n=args.remove_every_n)
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(dst), fourcc, fps, (width, height))
 
-        frame_counter = 0
-        for packet in container.demux(stream):
-            for frame in packet.decode():
-                episode_of_frame = frame_counter // frames_per_episode
-                if episode_of_frame in good_set:
-                    img = frame.to_ndarray(format="bgr24")
-                    img, _ = apply_color_jitter(img, rng=rng)
-                    img, _ = apply_occlusion_patch(img, rng=rng)
-                    writer.write(img)
-                frame_counter += 1
+def build_drifting_blob(args):
+    return DriftingBlob(
+        radius=args.blob_radius,
+        speed=args.blob_speed,
+        softness=args.blob_softness,
+        opacity=args.blob_opacity,
+    )
 
-        container.close()
-        writer.release()
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
 
-        console.print(
-            f"  [dim]cam {cam_key} copy {c} → {dst.relative_to(output_dataset_dir)}[/]"
+def build_horizontal_flip(args):
+    if args.robot_type and args.robot_type in ROBOT_PRESETS:
+        preset = ROBOT_PRESETS[args.robot_type]
+        return HorizontalFlipWithActionMirror(
+            action_mirror_mask=args.action_mirror_mask or preset["action_mirror_mask"],
+            state_mirror_mask=args.state_mirror_mask or preset["state_mirror_mask"],
+            swap_action_ranges=preset.get("swap_action_ranges"),
+            swap_state_ranges=preset.get("swap_state_ranges"),
         )
+    if not args.action_mirror_mask or not args.state_mirror_mask:
+        raise SystemExit("Error: --action-mirror-mask and --state-mirror-mask are required when --robot-type is not specified.")
+    return HorizontalFlipWithActionMirror(args.action_mirror_mask, args.state_mirror_mask)
 
 
-# ---------------------------------------------------------------------------
-# full_run  — 7-stage end-to-end pipeline
-# ---------------------------------------------------------------------------
+AUGMENTATION_BUILDERS = {
+    "color_jitter": build_color_jitter,
+    "gaussian_blur": build_gaussian_blur,
+    "sharpness": build_sharpness,
+    "random_erasing": build_random_erasing,
+    "static_erasing": build_static_erasing,
+    "frame_decimate": build_frame_decimate,
+    "drifting_blob": build_drifting_blob,
+    "horizontal_flip": build_horizontal_flip,
+}
 
-def full_run(
-    repo_id: str,
-    output_dir: str,
-    hf_repo_id: str | None = None,
-    n_aug_copies: int = 2,
-    seed: int = 42,
-    sparc_threshold: float = -10.0,
-    saturation_threshold: float = 0.15,
-    skip_sam3: bool = True,
-    skip_text: bool = True,
-    token: str | None = None,
-    private: bool = False,
-) -> None:
-    """End-to-end 7-stage augmentation pipeline for LeRobot v3 datasets.
 
-    Args:
-        repo_id: Source HuggingFace dataset, e.g. 'lerobot/aloha_static_cups_open'.
-        output_dir: Root directory for all outputs.
-        hf_repo_id: If set, upload result to this HF repo and print visualizer URL.
-        n_aug_copies: Visual augmentation copies per kept episode.
-        seed: Base random seed.
-        sparc_threshold: Episodes with SPARC < threshold are dropped.
-        saturation_threshold: Episodes with saturation ratio > threshold are dropped.
-        skip_sam3: Skip SAM3 background replacement (stage 3).
-        skip_text: Skip text relabeling (stage 4).
-        token: HuggingFace write token (or set HF_TOKEN env var).
-        private: Create the HF repo as private.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_dataset_dir = output_dir / "dataset"
-    output_dataset_dir.mkdir(parents=True, exist_ok=True)
+def build_transform(args):
+    transforms = []
+    for name in args.augmentations:
+        if name not in AUGMENTATION_BUILDERS:
+            raise SystemExit(f"Unknown augmentation: {name}. Available: {list(AUGMENTATION_BUILDERS.keys())}")
+        transforms.append(AUGMENTATION_BUILDERS[name](args))
 
-    # ── Stage 1: Pre-filter ──────────────────────────────────────────────────
-    console.rule("[bold cyan]Stage 1 — Pre-filter[/]")
-    console.print(f"Loading dataset [bold]{repo_id}[/] …")
-    dataset = _load_dataset(repo_id)
-    console.print(f"  {dataset.num_episodes} episodes, {len(dataset)} frames total")
+    if len(transforms) == 1:
+        return transforms[0]
+    return v2.Compose(transforms)
 
-    dataset_root = Path(dataset.root)
-    info = _read_info_json(dataset_root)
-    fps = _get_fps(info)
 
-    # Load flat parquet
-    src_parquet_path = dataset_root / "data" / "chunk-000" / "file-000.parquet"
-    console.print(f"  Reading parquet: {src_parquet_path}")
-    src_df = pd.read_parquet(src_parquet_path)
+def _episode_record(episodes, ep_idx: int):
+    if hasattr(episodes, "iloc"):
+        return episodes.iloc[ep_idx]
+    return episodes[ep_idx]
 
-    n_episodes = dataset.num_episodes
-    n_total_frames = len(src_df)
-    frames_per_episode = n_total_frames // n_episodes if n_episodes > 0 else 400
 
-    # Score each episode
-    scores = []
-    good_indices = []
+def get_episode_range(source, ep_idx):
+    ep = _episode_record(source.meta.episodes, ep_idx)
+    if hasattr(ep, "to_dict"):
+        ep = ep.to_dict()
+    return ep["dataset_from_index"], ep["dataset_to_index"]
 
-    for ep_idx in range(n_episodes):
-        state_list, actions = _episode_arrays_from_parquet(src_df, ep_idx)
-        sparc = score_sparc(state_list, actions)
-        sat = score_actuator_saturation(state_list, actions)
-        kept = sparc >= sparc_threshold and sat <= saturation_threshold
-        scores.append({"episode_idx": ep_idx, "sparc": sparc, "saturation": sat, "kept": kept})
-        if kept:
-            good_indices.append(ep_idx)
 
-    filter_table = Table(title="Pre-filter scores", header_style="bold")
-    filter_table.add_column("Episode", justify="right")
-    filter_table.add_column("SPARC", justify="right")
-    filter_table.add_column("Saturation", justify="right")
-    filter_table.add_column("Kept")
-    for s in scores:
-        kept_str = "[green]yes[/]" if s["kept"] else "[red]no[/]"
-        filter_table.add_row(
-            str(s["episode_idx"]),
-            f"{s['sparc']:.3f}",
-            f"{s['saturation']:.3f}",
-            kept_str,
-        )
-    console.print(filter_table)
-    console.print(f"Kept [bold]{len(good_indices)}[/] / {n_episodes} episodes")
-
-    if not good_indices:
-        console.print("[bold red]No episodes passed the filters. Exiting.[/]")
-        return
-
-    # ── Stage 2: Visual augmentation and output construction ─────────────────
-    console.rule("[bold cyan]Stage 2 — Visual augmentation[/]")
-
-    cam_keys = _get_camera_keys(info)
-    if not cam_keys:
-        console.print("[yellow]No video features found in info.json — skipping video processing.[/]")
-
-    for cam_key in cam_keys:
-        src_video = dataset_root / "videos" / cam_key / "chunk-000" / "file-000.mp4"
-        if not src_video.exists():
-            console.print(f"  [yellow]Source video not found: {src_video}[/]")
+def build_frame_dict(item, feature_keys, features_meta):
+    frame = {"task": item.get("task", "robot manipulation")}
+    for key in feature_keys:
+        if key in {"timestamp", "index", "episode_index", "frame_index", "task_index"}:
             continue
-        console.print(f"  Processing camera [bold]{cam_key}[/] …")
-        _process_camera(
-            src_video=src_video,
-            cam_key=cam_key,
-            good_indices=good_indices,
-            frames_per_episode=frames_per_episode,
-            n_aug_copies=n_aug_copies,
-            fps=fps,
-            output_dataset_dir=output_dataset_dir,
-            seed=seed,
-        )
-
-    # ── Stage 3: SAM3 (optional) ─────────────────────────────────────────────
-    if skip_sam3:
-        console.rule("[dim]Stage 3 — SAM3 background replacement (skipped)[/]")
-    else:
-        console.rule("[bold cyan]Stage 3 — SAM3 background replacement[/]")
-        console.print("[yellow]SAM3 module not yet implemented — skipping.[/]")
-
-    # ── Stage 4: Text relabeling (optional) ──────────────────────────────────
-    if skip_text:
-        console.rule("[dim]Stage 4 — Text relabeling (skipped)[/]")
-    else:
-        console.rule("[bold cyan]Stage 4 — Text relabeling[/]")
-        console.print("[yellow]Text relabeling module not yet implemented — skipping.[/]")
-
-    # ── Stage 5: Metadata sync ───────────────────────────────────────────────
-    console.rule("[bold cyan]Stage 5 — Metadata sync[/]")
-
-    # --- Build augmented data parquet ---
-    pieces = []
-    global_frame_counter = 0
-    n_good = len(good_indices)
-
-    for c in range(n_aug_copies):
-        for local_idx, orig_ep in enumerate(good_indices):
-            new_ep_idx = c * n_good + local_idx
-            ep_rows = src_df[src_df["episode_index"] == orig_ep].copy()
-            ep_rows = ep_rows.sort_values("frame_index").reset_index(drop=True)
-            n_frames = len(ep_rows)
-            ep_rows["episode_index"] = new_ep_idx
-            ep_rows["frame_index"] = range(n_frames)
-            ep_rows["index"] = range(global_frame_counter, global_frame_counter + n_frames)
-            ep_rows["timestamp"] = [i / fps for i in range(n_frames)]
-            pieces.append(ep_rows)
-            global_frame_counter += n_frames
-
-    aug_df = pd.concat(pieces, ignore_index=True)
-    aug_data_dir = output_dataset_dir / "data" / "chunk-000"
-    aug_data_dir.mkdir(parents=True, exist_ok=True)
-    aug_parquet_path = aug_data_dir / "file-000.parquet"
-    aug_df.to_parquet(aug_parquet_path, index=False, compression="zstd")
-    console.print(f"  Data parquet written: {aug_parquet_path} ({len(aug_df)} rows)")
-
-    # --- Build episodes meta parquet ---
-    src_episodes_path = dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
-    src_episodes_df = None
-    if src_episodes_path.exists():
-        src_episodes_df = pd.read_parquet(src_episodes_path)
-
-    ep_duration = frames_per_episode / fps
-    new_ep_rows = []
-    new_global_from = 0
-
-    for c in range(n_aug_copies):
-        for local_idx, orig_ep in enumerate(good_indices):
-            new_ep_idx = c * n_good + local_idx
-            n_frames = frames_per_episode  # approximate; exact count per episode
-
-            row: dict[str, Any] = {
-                "episode_index": new_ep_idx,
-                "dataset_from_index": new_global_from,
-                "dataset_to_index": new_global_from + n_frames,
-                "length": n_frames,
-                "tasks": ["robot manipulation"],  # default; overridden below if we have meta
-            }
-
-            # Copy stats and other columns from original if available
-            if src_episodes_df is not None and "episode_index" in src_episodes_df.columns:
-                orig_rows = src_episodes_df[src_episodes_df["episode_index"] == orig_ep]
-                if not orig_rows.empty:
-                    orig_row = orig_rows.iloc[0].to_dict()
-                    # Carry over stats columns
-                    for col, val in orig_row.items():
-                        if col not in row:
-                            row[col] = val
-                    # Override key columns
-                    row["episode_index"] = new_ep_idx
-                    row["dataset_from_index"] = new_global_from
-                    row["dataset_to_index"] = new_global_from + n_frames
-                    row["length"] = orig_row.get("length", n_frames)
-                    # Update tasks if available
-                    if "tasks" in orig_row:
-                        row["tasks"] = orig_row["tasks"]
-
-            # Update video timestamps and chunk pointers for each camera
-            from_ts = new_ep_idx * ep_duration
-            to_ts = from_ts + ep_duration
-            for cam_key in cam_keys:
-                ts_from_col = f"videos/{cam_key}/timestamp_from"
-                ts_to_col = f"videos/{cam_key}/timestamp_to"
-                chunk_col = f"videos/{cam_key}/chunk_index"
-                file_col = f"videos/{cam_key}/file_index"
-                row[ts_from_col] = from_ts
-                row[ts_to_col] = to_ts
-                row[chunk_col] = c
-                row[file_col] = 0
-
-            new_global_from += n_frames
-            new_ep_rows.append(row)
-
-    new_episodes_df = pd.DataFrame(new_ep_rows)
-    aug_episodes_dir = output_dataset_dir / "meta" / "episodes" / "chunk-000"
-    aug_episodes_dir.mkdir(parents=True, exist_ok=True)
-    aug_episodes_path = aug_episodes_dir / "file-000.parquet"
-    new_episodes_df.to_parquet(aug_episodes_path, index=False, compression="zstd")
-    console.print(f"  Episodes meta written: {aug_episodes_path} ({len(new_episodes_df)} episodes)")
-
-    # --- Copy tasks.parquet unchanged ---
-    src_tasks_path = dataset_root / "meta" / "tasks.parquet"
-    if src_tasks_path.exists():
-        dst_tasks_dir = output_dataset_dir / "meta"
-        dst_tasks_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_tasks_path, dst_tasks_dir / "tasks.parquet")
-        console.print("  tasks.parquet copied")
-
-    # --- Write new info.json ---
-    new_total_episodes = n_aug_copies * n_good
-    new_total_frames = global_frame_counter
-
-    new_info = dict(info)
-    new_info["total_episodes"] = new_total_episodes
-    new_info["total_frames"] = new_total_frames
-    new_info["splits"] = {"train": f"0:{new_total_episodes}"}
-    # Update data_path and video_path templates if present (keep same pattern)
-    if "data_path" not in new_info:
-        new_info["data_path"] = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
-    if "video_path" not in new_info:
-        new_info["video_path"] = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
-
-    aug_meta_dir = output_dataset_dir / "meta"
-    aug_meta_dir.mkdir(parents=True, exist_ok=True)
-    info_out_path = aug_meta_dir / "info.json"
-    info_out_path.write_text(json.dumps(new_info, indent=2))
-    console.print(f"  info.json written: {info_out_path}")
-    console.print(f"  Synced: {new_total_episodes} episodes, {new_total_frames} frames")
-
-    # ── Stage 6: Quality report ──────────────────────────────────────────────
-    console.rule("[bold cyan]Stage 6 — Quality report[/]")
-
-    sample_n = min(10, n_good)
-    sampled_orig = good_indices[:sample_n]
-
-    orig_sparc_scores = []
-    for ep_idx in sampled_orig:
-        sl, act = _episode_arrays_from_parquet(src_df, ep_idx)
-        orig_sparc_scores.append(score_sparc(sl, act))
-
-    orig_mean_sparc = float(np.mean(orig_sparc_scores)) if orig_sparc_scores else float("nan")
-    # Augmented episodes have the same trajectories (only visual changes), so SPARC is the same
-    aug_mean_sparc = orig_mean_sparc
-
-    sparc_delta_pct = 0.0  # visual aug doesn't change trajectories
-
-    report_table = Table(title="Quality Report", header_style="bold magenta")
-    report_table.add_column("Metric")
-    report_table.add_column("Before", justify="right")
-    report_table.add_column("After", justify="right")
-
-    report_table.add_row("n_episodes", str(n_episodes), str(new_total_episodes))
-    report_table.add_row("n_frames", str(n_total_frames), str(new_total_frames))
-    report_table.add_row("n_kept_episodes", str(n_good), str(n_good))
-    report_table.add_row(
-        "mean_SPARC (sample)",
-        f"{orig_mean_sparc:.3f}",
-        f"{aug_mean_sparc:.3f}",
-    )
-    console.print(report_table)
-
-    report_dict: dict[str, Any] = {
-        "source_repo": repo_id,
-        "output_dir": str(output_dir),
-        "n_original_episodes": n_episodes,
-        "n_kept_episodes": n_good,
-        "n_augmented_episodes": new_total_episodes,
-        "n_original_frames": n_total_frames,
-        "n_augmented_frames": new_total_frames,
-        "original_mean_sparc": orig_mean_sparc,
-        "augmented_mean_sparc": aug_mean_sparc,
-        "sparc_delta_pct": sparc_delta_pct,
-    }
-    report_path = output_dir / "augmentation_report.json"
-    report_path.write_text(json.dumps(report_dict, indent=2))
-    console.print(f"  Report saved → {report_path}")
-
-    # ── Stage 7: Upload ──────────────────────────────────────────────────────
-    if hf_repo_id:
-        console.rule("[bold cyan]Stage 7 — Upload to HuggingFace Hub[/]")
-        url = upload_dataset(output_dataset_dir, hf_repo_id, token=token, private=private)
-        console.print(f"[bold green]Visualizer:[/] {url}")
-    else:
-        console.rule("[dim]Stage 7 — Upload (skipped — no --hf_repo_id provided)[/]")
-        console.print("[dim]Pass --hf_repo_id=<your-user/dataset-name> to upload.[/]")
-
-    console.print(f"\n[bold green]Pipeline complete.[/] Output: {output_dataset_dir}")
+        if key in item:
+            val = item[key]
+            if isinstance(val, torch.Tensor):
+                val = val.numpy()
+            if hasattr(val, "ndim") and val.ndim == 3 and val.shape[0] == 3:
+                val = np.transpose(val, (1, 2, 0))
+            if key in features_meta:
+                expected_shape = tuple(features_meta[key]["shape"])
+                if getattr(val, "ndim", None) == 0 and expected_shape == (1,):
+                    val = val.reshape(1)
+            frame[key] = val
+    return frame
 
 
-# ---------------------------------------------------------------------------
-# run  — shortcut without upload
-# ---------------------------------------------------------------------------
+def copy_episode(source, output, ep_idx, feature_keys, features_meta):
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+    for global_idx in range(from_idx, to_idx):
+        item = source[global_idx]
+        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
+    output.save_episode()
 
-def run(
-    repo_id: str,
-    output_dir: str,
-    sparc_threshold: float = -10.0,
-    saturation_threshold: float = 0.15,
-    n_aug_copies: int = 2,
-    seed: int = 42,
-) -> None:
-    """Filter + augment + sync metadata for a LeRobot v3 dataset. Does not upload.
 
-    For the end-to-end pipeline including upload, use `full_run`.
-    """
-    full_run(
-        repo_id=repo_id,
-        output_dir=output_dir,
-        hf_repo_id=None,
-        n_aug_copies=n_aug_copies,
-        seed=seed,
-        sparc_threshold=sparc_threshold,
-        saturation_threshold=saturation_threshold,
-        skip_sam3=True,
-        skip_text=True,
-        token=None,
-        private=False,
+def decimate_episode(source, output, ep_idx, decimator, feature_keys, features_meta):
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+    for local_idx, global_idx in enumerate(range(from_idx, to_idx)):
+        if not decimator.should_keep(local_idx):
+            continue
+        item = source[global_idx]
+        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
+    output.save_episode()
+
+
+def augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta):
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+
+    if isinstance(transform, (StaticErasing, DriftingBlob)):
+        first = source[from_idx]
+        for cam_key in camera_keys:
+            if cam_key in first:
+                _, h, w = first[cam_key].shape
+                transform.resample(h, w)
+                break
+
+    for global_idx in range(from_idx, to_idx):
+        item = source[global_idx]
+        for cam_key in camera_keys:
+            if cam_key in item:
+                item[cam_key] = transform(item[cam_key])
+        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
+    output.save_episode()
+
+
+def augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera_keys, features_meta):
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+
+    for global_idx in range(from_idx, to_idx):
+        item = source[global_idx]
+        for cam_key in camera_keys:
+            if cam_key in item:
+                item[cam_key] = flip.flip_image(item[cam_key])
+        if "action" in item:
+            item["action"] = flip.mirror_actions(item["action"])
+        if "observation.state" in item:
+            item["observation.state"] = flip.mirror_state(item["observation.state"])
+        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
+    output.save_episode()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Augment a LeRobot v3 dataset and push to Hugging Face Hub")
+
+    parser.add_argument("--source", required=True, help="Source dataset repo_id (e.g. lerobot/aloha_static_cups_open)")
+    parser.add_argument("--output", required=True, help="Output dataset repo_id (e.g. user/dataset_augmented)")
+    parser.add_argument("--num-passes", type=int, default=2, help="Number of augmented copies per episode")
+    parser.add_argument("--augmentations", nargs="+", default=["color_jitter"], choices=list(AUGMENTATION_BUILDERS.keys()))
+    parser.add_argument("--include-originals", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--episodes", nargs="+", type=int, default=None)
+
+    parser.add_argument("--brightness", nargs=2, type=float, default=[0.8, 1.2])
+    parser.add_argument("--contrast", nargs=2, type=float, default=[0.8, 1.2])
+    parser.add_argument("--saturation", nargs=2, type=float, default=[0.5, 1.5])
+    parser.add_argument("--hue", nargs=2, type=float, default=[-0.05, 0.05])
+
+    parser.add_argument("--blur-kernel", type=int, default=5)
+    parser.add_argument("--blur-sigma", nargs=2, type=float, default=[0.1, 2.0])
+    parser.add_argument("--sharpness-factor", type=float, default=2.0)
+    parser.add_argument("--erasing-p", type=float, default=0.5)
+    parser.add_argument("--erasing-scale", nargs=2, type=float, default=[0.02, 0.15])
+    parser.add_argument("--blob-radius", type=int, default=30)
+    parser.add_argument("--blob-speed", type=float, default=2.0)
+    parser.add_argument("--blob-softness", type=float, default=0.6)
+    parser.add_argument("--blob-opacity", type=float, default=0.5)
+    parser.add_argument("--remove-every-n", type=int, default=5)
+
+    parser.add_argument("--robot-type", type=str, default=None, choices=list(ROBOT_PRESETS.keys()))
+    parser.add_argument("--action-mirror-mask", nargs="+", type=float, default=None)
+    parser.add_argument("--state-mirror-mask", nargs="+", type=float, default=None)
+
+    parser.add_argument("--vcodec", default="libsvtav1")
+    parser.add_argument("--image-writer-threads", type=int, default=4)
+    parser.add_argument("--video-backend", default="pyav", choices=["pyav", "video_reader", "torchcodec"])
+    parser.add_argument("--no-push", action="store_true")
+    parser.add_argument("--force", action="store_true")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    t0 = time.time()
+
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+
+    if args.force:
+        import shutil
+
+        cache_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / args.output
+        if cache_dir.exists():
+            print(f"Removing existing cache: {cache_dir}")
+            shutil.rmtree(cache_dir)
+
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.utils import DEFAULT_FEATURES
+
+    print(f"Loading source dataset: {args.source}")
+    source = LeRobotDataset(args.source, video_backend=args.video_backend)
+
+    camera_keys = source.meta.camera_keys
+    feature_keys = list(source.meta.features.keys())
+    episode_indices = args.episodes if args.episodes else list(range(source.meta.total_episodes))
+
+    print(f"  Episodes: {source.meta.total_episodes} ({len(episode_indices)} selected)")
+    print(f"  Frames: {source.meta.total_frames}, FPS: {source.fps}")
+    print(f"  Cameras: {camera_keys}")
+    print(f"  Robot: {source.meta.robot_type}")
+
+    n_original = len(episode_indices) if args.include_originals else 0
+    n_augmented = len(episode_indices) * args.num_passes
+    print("\nOutput plan:")
+    print(f"  Original episodes: {n_original}")
+    print(f"  Augmented episodes: {n_augmented} ({args.num_passes} passes)")
+    print(f"  Total episodes: {n_original + n_augmented}")
+    print(f"  Augmentations: {args.augmentations}")
+
+    features_meta = source.meta.features
+    user_features = {k: v for k, v in features_meta.items() if k not in set(DEFAULT_FEATURES.keys())}
+
+    print(f"\nCreating output dataset: {args.output}")
+    output = LeRobotDataset.create(
+        repo_id=args.output,
+        fps=source.fps,
+        features=user_features,
+        robot_type=source.meta.robot_type,
+        use_videos=len(source.meta.camera_keys) > 0,
+        video_backend=args.video_backend,
+        vcodec=args.vcodec,
+        image_writer_threads=args.image_writer_threads,
     )
 
+    try:
+        if args.include_originals:
+            print("\nCopying original episodes...")
+            for ep_idx in tqdm(episode_indices, desc="Originals"):
+                copy_episode(source, output, ep_idx, feature_keys, features_meta)
 
-# ---------------------------------------------------------------------------
-# report  — standalone quality comparison
-# ---------------------------------------------------------------------------
+        use_decimation = "frame_decimate" in args.augmentations
+        use_flip = "horizontal_flip" in args.augmentations
+        image_augmentations = [a for a in args.augmentations if a not in ("frame_decimate", "horizontal_flip")]
 
-def report(original_repo_id: str, augmented_output_dir: str) -> None:
-    """Print a quality comparison table for an existing augmented dataset.
+        if use_decimation:
+            decimator = build_frame_decimate(args)
+            print(f"\nFrame decimation: {decimator}")
 
-    Args:
-        original_repo_id: Source HF dataset ID.
-        augmented_output_dir: Directory produced by `run` or `full_run`.
-    """
-    augmented_output_dir = Path(augmented_output_dir)
-    dst_root = augmented_output_dir / "dataset"
+        if use_flip:
+            flip = build_horizontal_flip(args)
+            print(f"Horizontal flip: {flip}")
 
-    info_path = dst_root / "meta" / "info.json"
-    if not info_path.exists():
-        console.print(f"[red]No meta/info.json found in {dst_root}[/]")
-        return
+        if image_augmentations:
+            saved = args.augmentations
+            args.augmentations = image_augmentations
+            transform = build_transform(args)
+            args.augmentations = saved
+            print(f"Image transform: {transform}")
 
-    with open(info_path) as f:
-        aug_info = json.load(f)
+        for pass_idx in range(args.num_passes):
+            if args.seed is not None:
+                torch.manual_seed(args.seed + pass_idx + 1)
 
-    dataset = _load_dataset(original_repo_id)
-    dataset_root = Path(dataset.root)
-    src_parquet_path = dataset_root / "data" / "chunk-000" / "file-000.parquet"
-    src_df = pd.read_parquet(src_parquet_path)
+            for ep_idx in tqdm(episode_indices, desc=f"Pass {pass_idx + 1}/{args.num_passes}"):
+                if use_decimation and not image_augmentations and not use_flip:
+                    decimate_episode(source, output, ep_idx, decimator, feature_keys, features_meta)
+                elif use_flip and not use_decimation and not image_augmentations:
+                    augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera_keys, features_meta)
+                elif not use_decimation and not use_flip and image_augmentations:
+                    augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta)
+                else:
+                    from_idx, to_idx = get_episode_range(source, ep_idx)
+                    for local_idx, global_idx in enumerate(range(from_idx, to_idx)):
+                        if use_decimation and not decimator.should_keep(local_idx):
+                            continue
+                        item = source[global_idx]
+                        for cam_key in camera_keys:
+                            if cam_key in item:
+                                if use_flip:
+                                    item[cam_key] = flip.flip_image(item[cam_key])
+                                if image_augmentations:
+                                    item[cam_key] = transform(item[cam_key])
+                        if use_flip:
+                            if "action" in item:
+                                item["action"] = flip.mirror_actions(item["action"])
+                            if "observation.state" in item:
+                                item["observation.state"] = flip.mirror_state(item["observation.state"])
+                        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
+                    output.save_episode()
 
-    sample_n = min(10, dataset.num_episodes)
-    orig_sparc_scores = []
-    for ep_idx in range(sample_n):
-        sl, act = _episode_arrays_from_parquet(src_df, ep_idx)
-        orig_sparc_scores.append(score_sparc(sl, act))
+        print("\nFinalizing dataset...")
+        output.finalize()
 
-    mean_orig = float(np.mean(orig_sparc_scores)) if orig_sparc_scores else float("nan")
+        if not args.no_push:
+            print("Pushing to Hugging Face Hub...")
+            output.push_to_hub()
 
-    table = Table(title="Quality Comparison", header_style="bold magenta")
-    table.add_column("Metric")
-    table.add_column("Original", justify="right")
-    table.add_column("Augmented", justify="right")
+    except Exception:
+        output.finalize()
+        raise
 
-    table.add_row("episodes", str(dataset.num_episodes), str(aug_info.get("total_episodes", "?")))
-    table.add_row("frames", str(len(dataset)), str(aug_info.get("total_frames", "?")))
-    table.add_row("mean_SPARC (sample)", f"{mean_orig:.3f}", "—")
-    console.print(table)
-
-
-# ---------------------------------------------------------------------------
-# extract_masks  — SAM3 stub
-# ---------------------------------------------------------------------------
-
-def extract_masks(repo_id: str, output_mask_dir: str) -> None:
-    """Extract SAM3 robot masks. Not yet implemented."""
-    console.print("[yellow]SAM3 not yet implemented.[/]")
-
-
-# ---------------------------------------------------------------------------
-# main entry point
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    fire.Fire(
-        {
-            "run": run,
-            "full_run": full_run,
-            "report": report,
-            "extract_masks": extract_masks,
-            "upload": upload_dataset,
-        }
-    )
+    print(f"\nDone in {time.time() - t0:.1f}s")
+    print(f"Total episodes: {n_original + n_augmented}")
+    encoded_path = quote(args.output, safe="")
+    print(f"\nVisualizer link:\n  https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2F{encoded_path}%2Fepisode_0")
 
 
 if __name__ == "__main__":

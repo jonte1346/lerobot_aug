@@ -5,24 +5,15 @@ build-backend = "hatchling.build"
 [project]
 name = "aloha-augment"
 version = "0.1.0"
-description = "Augmentation pipeline for the LeRobot ALOHA dataset"
+description = "LeRobot v3 dataset augmentation tool"
 requires-python = ">=3.10"
 dependencies = [
-    "lerobot",
-    "opencv-python",
     "numpy",
-    "scipy",
-    "rich",
-    "fire",
-    "torch",
-    "huggingface_hub",
-    "pandas",
-    "pyarrow",
 ]
 
 [project.optional-dependencies]
-clip = ["transformers", "Pillow"]
-dev  = ["pytest"]
+pipeline = ["lerobot>=0.4.4", "torch", "torchvision", "tqdm"]
+dev = ["pytest"]
 
 [project.scripts]
 aloha-augment = "aloha_augment.pipeline:main"
