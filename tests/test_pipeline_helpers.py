@@ -2,7 +2,14 @@
 
 from types import SimpleNamespace
 
-from aloha_augment.pipeline import _parser_defaults, apply_tier_configuration, build_parser, get_temporal_selector
+from aloha_augment.pipeline import (
+    _parser_defaults,
+    apply_tier_configuration,
+    build_parser,
+    compute_effective_action_shift,
+    get_temporal_selector,
+)
+from aloha_augment.transforms import FrameStride
 
 
 def test_tier1_configuration_applies_structural_fixes():
@@ -97,3 +104,11 @@ def test_temporal_selector_cycles_across_passes():
     assert get_temporal_selector(args, 0).keep_every_n == 2
     assert get_temporal_selector(args, 1).keep_every_n == 3
     assert get_temporal_selector(args, 2).keep_every_n == 4
+
+
+def test_effective_action_shift_matches_decimated_space():
+    selector = FrameStride(keep_every_n=3, start_offset=0)
+    assert compute_effective_action_shift(4, selector) == 1
+    assert compute_effective_action_shift(6, selector) == 2
+    assert compute_effective_action_shift(0, selector) == 0
+    assert compute_effective_action_shift(4, None) == 4

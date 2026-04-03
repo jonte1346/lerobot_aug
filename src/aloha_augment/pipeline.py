@@ -225,6 +225,16 @@ def get_temporal_selector(args, pass_idx: int):
     return FrameStride(keep_every_n=stride, start_offset=offset)
 
 
+def compute_effective_action_shift(action_shift: int, temporal_selector) -> int:
+    """Project action shift into selected-frame space."""
+    if action_shift <= 0:
+        return 0
+    stride = 1
+    if temporal_selector is not None and hasattr(temporal_selector, "keep_every_n"):
+        stride = max(1, int(temporal_selector.keep_every_n))
+    return int(round(action_shift / stride))
+
+
 def _normalize_value(value):
     if isinstance(value, torch.Tensor):
         value = value.numpy()
@@ -267,6 +277,41 @@ def build_frame_dict(item, feature_keys, features_meta, action_override=None):
     return frame
 
 
+def _lerp_value(v0, v1, alpha: float):
+    if isinstance(v0, torch.Tensor):
+        return v0 * (1.0 - alpha) + v1 * alpha
+    return v0 * (1.0 - alpha) + v1 * alpha
+
+
+def _interp_key_at_pos(source, selected_indices, pos: float, key: str):
+    lo = int(np.floor(pos))
+    hi = int(np.ceil(pos))
+    lo = max(0, min(lo, len(selected_indices) - 1))
+    hi = max(0, min(hi, len(selected_indices) - 1))
+    alpha = float(pos - lo)
+
+    item_lo = source[selected_indices[lo]]
+    if key not in item_lo:
+        return None
+    v0 = item_lo[key]
+    if lo == hi or alpha <= 1e-8:
+        return v0
+
+    item_hi = source[selected_indices[hi]]
+    if key not in item_hi:
+        return v0
+    v1 = item_hi[key]
+    return _lerp_value(v0, v1, alpha)
+
+
+def _add_action_noise(action, std: float):
+    if std <= 0.0 or action is None:
+        return action
+    if isinstance(action, torch.Tensor):
+        return action + torch.randn_like(action) * std
+    return action + np.random.normal(0.0, std, size=action.shape).astype(action.dtype)
+
+
 def write_episode(
     source,
     output,
@@ -279,12 +324,36 @@ def write_episode(
     transform=None,
     flip=None,
     tail_drop_max=0,
+    temporal_jitter_pct=0.0,
+    action_noise_std=0.0,
 ):
     from_idx, to_idx = get_episode_range(source, ep_idx)
     tail_drop = int(np.random.randint(0, tail_drop_max + 1)) if tail_drop_max > 0 else 0
-    effective_to_idx = to_idx - action_shift - tail_drop
+    effective_to_idx = to_idx - tail_drop
 
     if effective_to_idx <= from_idx:
+        return
+
+    selected_indices = []
+    for local_idx, global_idx in enumerate(range(from_idx, effective_to_idx)):
+        if temporal_selector is not None and not temporal_selector.should_keep(local_idx):
+            continue
+        selected_indices.append(global_idx)
+
+    if not selected_indices:
+        return
+
+    effective_shift = compute_effective_action_shift(action_shift, temporal_selector)
+    n_selected = len(selected_indices)
+
+    positions = np.arange(n_selected, dtype=np.float32)
+    if temporal_jitter_pct > 0.0 and n_selected > 1:
+        speed_scale = float(np.random.uniform(1.0 - temporal_jitter_pct, 1.0 + temporal_jitter_pct))
+        target_len = max(2, int(round(n_selected * speed_scale)))
+        positions = np.linspace(0.0, float(n_selected - 1), num=target_len, dtype=np.float32)
+
+    usable_len = len(positions) - effective_shift
+    if usable_len <= 0:
         return
 
     if transform is not None:
@@ -298,17 +367,27 @@ def write_episode(
                 transform.resample(h, w)
                 break
 
-    for local_idx, global_idx in enumerate(range(from_idx, effective_to_idx)):
-        if temporal_selector is not None and not temporal_selector.should_keep(local_idx):
-            continue
+    for out_idx in range(usable_len):
+        obs_pos = float(positions[out_idx])
+        obs_seq_idx = int(round(obs_pos))
+        obs_seq_idx = max(0, min(obs_seq_idx, n_selected - 1))
+        global_idx = selected_indices[obs_seq_idx]
 
         item = dict(source[global_idx])
         action_override = None
 
-        if action_shift:
-            future_item = source[global_idx + action_shift]
-            if "action" in future_item:
-                action_override = future_item["action"]
+        if effective_shift:
+            action_pos = float(positions[out_idx + effective_shift])
+            action_override = _interp_key_at_pos(source, selected_indices, action_pos, "action")
+        elif "action" in item:
+            action_override = item["action"]
+
+        if temporal_jitter_pct > 0.0:
+            interp_state = _interp_key_at_pos(source, selected_indices, obs_pos, "observation.state")
+            if interp_state is not None:
+                item["observation.state"] = interp_state
+
+        action_override = _add_action_noise(action_override, action_noise_std)
 
         for cam_key in camera_keys:
             if cam_key in item:
@@ -394,6 +473,11 @@ def build_parser():
     parser.add_argument("--num-passes", type=int, default=2, help="Number of augmented copies per episode")
     parser.add_argument("--augmentations", nargs="*", default=None, choices=list(AUGMENTATION_BUILDERS.keys()))
     parser.add_argument("--include-originals", action="store_true")
+    parser.add_argument(
+        "--include-originals-decimated",
+        action="store_true",
+        help="When copying originals, apply the same temporal selector/action-shift as augmented passes",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--episodes", nargs="+", type=int, default=None)
     parser.add_argument("--action-shift", type=int, default=0, help="Shift action labels forward by this many frames")
@@ -427,6 +511,18 @@ def build_parser():
     parser.add_argument("--blob-softness", type=float, default=0.6)
     parser.add_argument("--blob-opacity", type=float, default=0.5)
     parser.add_argument("--remove-every-n", type=int, default=5)
+    parser.add_argument(
+        "--action-noise-std",
+        type=float,
+        default=0.0,
+        help="Gaussian std for additive motor noise on actions (e.g. 0.003)",
+    )
+    parser.add_argument(
+        "--temporal-jitter-pct",
+        type=float,
+        default=0.0,
+        help="Per-episode temporal length jitter fraction in [0,1] (e.g. 0.15 for +/-15%)",
+    )
 
     parser.add_argument("--robot-type", type=str, default=None, choices=list(ROBOT_PRESETS.keys()))
     parser.add_argument("--action-mirror-mask", nargs="+", type=float, default=None)
@@ -469,6 +565,8 @@ def parse_args():
         args.augmentations = ["color_jitter"]
     if args.skip_sam3:
         args.augmentations = [a for a in args.augmentations if a != "sam3"]
+    if args.temporal_jitter_pct < 0 or args.temporal_jitter_pct > 1:
+        raise SystemExit("Error: --temporal-jitter-pct must be in [0, 1].")
     return args, defaults
 
 
@@ -535,6 +633,8 @@ def main():
         print(f"  Prefilter sample every N: {args.prefilter_sample_every_n}")
         print(f"  Min action delta: {args.min_action_delta}")
         print(f"  Max action jerk: {args.max_action_jerk}")
+        print(f"  Action noise std: {args.action_noise_std}")
+        print(f"  Temporal jitter pct: {args.temporal_jitter_pct}")
         if args.frame_stride_cycle:
             print(f"  Frame stride cycle: {args.frame_stride_cycle}")
 
@@ -564,6 +664,14 @@ def main():
     try:
         if args.include_originals:
             print("\nCopying original episodes...")
+            original_selector = get_temporal_selector(args, 0) if args.include_originals_decimated else None
+            original_effective_shift = compute_effective_action_shift(args.action_shift, original_selector)
+            if args.include_originals_decimated:
+                print(f"Original temporal selector: {original_selector}")
+                print(
+                    f"Original action shift: raw={args.action_shift} frames, "
+                    f"effective={original_effective_shift} selected-frame steps"
+                )
             for ep_idx in tqdm(episode_indices, desc="Originals"):
                 write_episode(
                     source,
@@ -573,7 +681,10 @@ def main():
                     camera_keys,
                     features_meta,
                     action_shift=args.action_shift,
+                    temporal_selector=original_selector,
                     tail_drop_max=args.tail_drop_max,
+                    temporal_jitter_pct=0.0,
+                    action_noise_std=0.0,
                 )
 
         use_frame_decimate = "frame_decimate" in args.augmentations
@@ -606,6 +717,11 @@ def main():
                 temporal_selector = frame_decimator
             if temporal_selector is not None:
                 print(f"Temporal selector pass {pass_idx + 1}: {temporal_selector}")
+            effective_shift = compute_effective_action_shift(args.action_shift, temporal_selector)
+            print(
+                f"Action shift pass {pass_idx + 1}: raw={args.action_shift} frames, "
+                f"effective={effective_shift} selected-frame steps"
+            )
 
             for ep_idx in tqdm(episode_indices, desc=f"Pass {pass_idx + 1}/{args.num_passes}"):
                 write_episode(
@@ -620,6 +736,8 @@ def main():
                     transform=transform,
                     flip=flip if use_flip else None,
                     tail_drop_max=args.tail_drop_max,
+                    temporal_jitter_pct=args.temporal_jitter_pct,
+                    action_noise_std=args.action_noise_std,
                 )
 
         print("\nFinalizing dataset...")
