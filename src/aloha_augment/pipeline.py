@@ -13,6 +13,7 @@ from tqdm import tqdm
 from torchvision.transforms import v2
 
 from .transforms import DriftingBlob, FrameDecimator, HorizontalFlipWithActionMirror, ROBOT_PRESETS, StaticErasing
+from .prefilter import filter_episodes, save_filter_scores
 
 
 def build_color_jitter(args):
@@ -67,6 +68,17 @@ def build_horizontal_flip(args):
     return HorizontalFlipWithActionMirror(args.action_mirror_mask, args.state_mirror_mask)
 
 
+class SAM3AugmentationMarker:
+    """Marker to indicate SAM3 augmentation should be applied (requires frame data)."""
+    def __call__(self, frame):
+        # This is a no-op transform; actual SAM3 augmentation happens at episode level
+        return frame
+
+
+def build_sam3(args):
+    return SAM3AugmentationMarker()
+
+
 AUGMENTATION_BUILDERS = {
     "color_jitter": build_color_jitter,
     "gaussian_blur": build_gaussian_blur,
@@ -76,6 +88,7 @@ AUGMENTATION_BUILDERS = {
     "frame_decimate": build_frame_decimate,
     "drifting_blob": build_drifting_blob,
     "horizontal_flip": build_horizontal_flip,
+    "sam3": build_sam3,
 }
 
 
@@ -213,6 +226,14 @@ def parse_args():
     parser.add_argument("--video-backend", default="pyav", choices=["pyav", "video_reader", "torchcodec"])
     parser.add_argument("--no-push", action="store_true")
     parser.add_argument("--force", action="store_true")
+    
+    # Pre-filtering options
+    parser.add_argument("--skip-prefilter", action="store_true", help="Skip pre-filtering (SPARC + saturation)")
+    parser.add_argument("--sparc-threshold", type=float, default=-10.0, help="SPARC threshold for smoothness")
+    parser.add_argument("--saturation-threshold", type=float, default=0.15, help="Max saturation fraction")
+    
+    # SAM3 augmentation options
+    parser.add_argument("--skip-sam3", action="store_true", help="Skip SAM3 background augmentation")
 
     return parser.parse_args()
 
@@ -242,8 +263,27 @@ def main():
     camera_keys = source.meta.camera_keys
     feature_keys = list(source.meta.features.keys())
     episode_indices = args.episodes if args.episodes else list(range(source.meta.total_episodes))
+    
+    # Pre-filtering: SPARC smoothness + saturation check
+    if not args.skip_prefilter:
+        print("\n=== Pre-filtering episodes ===")
+        kept_indices, filter_scores = filter_episodes(
+            source,
+            episode_indices=episode_indices,
+            sparc_threshold=args.sparc_threshold,
+            saturation_threshold_frac=args.saturation_threshold,
+            fps=source.fps,
+        )
+        
+        n_filtered = len(episode_indices) - len(kept_indices)
+        print(f"Filtered: {n_filtered} episodes rejected, {len(kept_indices)} kept")
+        
+        # Save filter scores for inspection
+        save_filter_scores(filter_scores, Path.home() / f"filter_scores_{args.output.replace('/', '_')}.json")
+        
+        episode_indices = kept_indices
 
-    print(f"  Episodes: {source.meta.total_episodes} ({len(episode_indices)} selected)")
+    print(f"\n  Episodes: {source.meta.total_episodes} ({len(episode_indices)} selected)")
     print(f"  Frames: {source.meta.total_frames}, FPS: {source.fps}")
     print(f"  Cameras: {camera_keys}")
     print(f"  Robot: {source.meta.robot_type}")
