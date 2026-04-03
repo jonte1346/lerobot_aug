@@ -33,6 +33,24 @@ class FrameDecimator:
         return f"FrameDecimator(remove_every_n={self.remove_every_n})"
 
 
+class FrameStride:
+    """Keep every Nth frame with an optional starting offset."""
+
+    def __init__(self, keep_every_n: int = 4, start_offset: int = 0):
+        if keep_every_n < 1:
+            raise ValueError(f"keep_every_n must be >= 1, got {keep_every_n}")
+        if start_offset < 0 or start_offset >= keep_every_n:
+            raise ValueError(f"start_offset must be in [0, {keep_every_n - 1}], got {start_offset}")
+        self.keep_every_n = keep_every_n
+        self.start_offset = start_offset
+
+    def should_keep(self, frame_index: int) -> bool:
+        return (frame_index - self.start_offset) % self.keep_every_n == 0
+
+    def __repr__(self):
+        return f"FrameStride(keep_every_n={self.keep_every_n}, start_offset={self.start_offset})"
+
+
 class StaticErasing:
     """Erases a fixed rectangle sampled once and applied to every frame."""
 

@@ -35,6 +35,33 @@ uv run aloha-augment \
   --num-passes 1 \
   --no-push \
   --force
+
+```
+
+Tiered runs for the dataset-fault diagnosis pipeline:
+
+```bash
+uv run aloha-augment \
+  --source lerobot/aloha_static_cups_open \
+  --output your-username/aloha_tier1 \
+  --tier tier1 \
+  --episodes 0 1 2 3 4 \
+  --video-backend pyav
+
+uv run aloha-augment \
+  --source lerobot/aloha_static_cups_open \
+  --output your-username/aloha_tier2 \
+  --tier tier2 \
+  --episodes 0 1 2 3 4 \
+  --video-backend pyav
+
+uv run aloha-augment \
+  --source lerobot/aloha_static_cups_open \
+  --output your-username/aloha_tier3 \
+  --tier tier3 \
+  --episodes 0 1 2 3 4 \
+  --video-backend pyav
+```
 ```
 
 Use `--no-push` to skip uploading to HF Hub and `--force` to overwrite the local cache for the output dataset. Run `uv run aloha-augment --help` for all options.
@@ -51,6 +78,13 @@ Use `--no-push` to skip uploading to HF Hub and `--force` to overwrite the local
 | `drifting_blob` | Soft blob drifting across frames |
 | `frame_decimate` | Remove every Nth frame |
 | `horizontal_flip` | Flip images and mirror actions/states |
+
+Temporal controls for the tier runs:
+
+- `--action-shift 4` aligns each training frame with the action four steps in the future.
+- `--keep-every-n N` keeps only every Nth frame to reduce temporal redundancy.
+- `--frame-stride-cycle 2 3 4` varies the stride across passes for timing diversity.
+- `--min-action-delta` rejects near-static episodes before augmentation.
 
 ## Project structure
 

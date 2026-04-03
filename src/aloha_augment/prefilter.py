@@ -85,11 +85,35 @@ def compute_actuator_saturation(
     return float(np.mean(saturation_per_step))
 
 
+def compute_mean_action_delta(action_sequence: np.ndarray) -> float:
+    """Compute the mean absolute frame-to-frame action delta.
+
+    This is a lightweight low-motion signal for filtering static or near-static episodes.
+    """
+    if len(action_sequence) < 2:
+        return 0.0
+    deltas = np.diff(action_sequence, axis=0)
+    return float(np.mean(np.abs(deltas)))
+
+
+def compute_mean_action_jerk(action_sequence: np.ndarray) -> float:
+    """Compute mean absolute second-order action difference as a jerk proxy."""
+    if len(action_sequence) < 3:
+        return 0.0
+    first_diff = np.diff(action_sequence, axis=0)
+    second_diff = np.diff(first_diff, axis=0)
+    return float(np.mean(np.abs(second_diff)))
+
+
 def filter_episodes(
     dataset,
     episode_indices: list[int] | None = None,
     sparc_threshold: float = -10.0,
     saturation_threshold_frac: float = 0.15,
+    min_action_delta: float = 0.02,
+    max_action_jerk: float | None = None,
+    mode: str = "full",
+    sample_every_n: int = 1,
     fps: int | None = None,
 ) -> tuple[list[int], dict]:
     """
@@ -134,6 +158,42 @@ def filter_episodes(
             
             from_idx = ep_record["dataset_from_index"]
             to_idx = ep_record["dataset_to_index"]
+
+            if mode == "fast":
+                action_seq = []
+                for global_idx in range(from_idx, to_idx, max(1, sample_every_n)):
+                    item = dataset[global_idx]
+                    if "action" in item:
+                        action_seq.append(item["action"].numpy() if hasattr(item["action"], "numpy") else item["action"])
+
+                if len(action_seq) < 2:
+                    scores[ep_idx] = {"sparc": None, "saturation": None, "action_delta": None, "kept": False, "reason": "insufficient sampled action data"}
+                    continue
+
+                action_seq = np.array(action_seq)
+                action_delta = compute_mean_action_delta(action_seq)
+                action_jerk = compute_mean_action_jerk(action_seq)
+                kept = action_delta >= min_action_delta
+                if max_action_jerk is not None:
+                    kept = kept and (action_jerk <= max_action_jerk)
+                reason = None
+                if action_delta < min_action_delta:
+                    reason = f"low_movement (delta={action_delta:.4f})"
+                if max_action_jerk is not None and action_jerk > max_action_jerk:
+                    reason = f"jerky_action (jerk={action_jerk:.4f})"
+                scores[ep_idx] = {
+                    "sparc": None,
+                    "saturation": None,
+                    "action_delta": float(action_delta),
+                    "action_jerk": float(action_jerk),
+                    "kept": kept,
+                    "reason": reason,
+                    "mode": mode,
+                    "sample_every_n": sample_every_n,
+                }
+                if kept:
+                    kept_indices.append(ep_idx)
+                continue
             
             # Load action and state sequences
             action_seq = []
@@ -155,19 +215,34 @@ def filter_episodes(
             # Compute metrics
             sparc_score = compute_sparc(state_seq, fps=fps)
             sat_frac = compute_actuator_saturation(action_seq, state_seq)
+            action_delta = compute_mean_action_delta(action_seq)
+            action_jerk = compute_mean_action_jerk(action_seq)
             
-            kept = (sparc_score <= sparc_threshold) and (sat_frac <= saturation_threshold_frac)
+            kept = (
+                (sparc_score <= sparc_threshold)
+                and (sat_frac <= saturation_threshold_frac)
+                and (action_delta >= min_action_delta)
+            )
+            if max_action_jerk is not None:
+                kept = kept and (action_jerk <= max_action_jerk)
             reason = None
             if sparc_score > sparc_threshold:
                 reason = f"jerky_motion (sparc={sparc_score:.2f})"
             if sat_frac > saturation_threshold_frac:
                 reason = f"saturation (frac={sat_frac:.2f})"
+            if action_delta < min_action_delta:
+                reason = f"low_movement (delta={action_delta:.4f})"
+            if max_action_jerk is not None and action_jerk > max_action_jerk:
+                reason = f"jerky_action (jerk={action_jerk:.4f})"
             
             scores[ep_idx] = {
                 "sparc": float(sparc_score),
                 "saturation": float(sat_frac),
+                "action_delta": float(action_delta),
+                "action_jerk": float(action_jerk),
                 "kept": kept,
                 "reason": reason,
+                "mode": mode,
             }
             
             if kept:

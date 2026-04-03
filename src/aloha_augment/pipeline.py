@@ -12,8 +12,37 @@ import torch
 from tqdm import tqdm
 from torchvision.transforms import v2
 
-from .transforms import DriftingBlob, FrameDecimator, HorizontalFlipWithActionMirror, ROBOT_PRESETS, StaticErasing
 from .prefilter import filter_episodes, save_filter_scores
+from .transforms import (
+    DriftingBlob,
+    FrameDecimator,
+    FrameStride,
+    HorizontalFlipWithActionMirror,
+    ROBOT_PRESETS,
+    StaticErasing,
+)
+
+
+def _walk_transforms(transform):
+    if transform is None:
+        return
+    if hasattr(transform, "transforms"):
+        for child in transform.transforms:
+            yield from _walk_transforms(child)
+        return
+    yield transform
+
+
+def reset_transform_state(transform):
+    for t in _walk_transforms(transform):
+        if hasattr(t, "reset_episode"):
+            t.reset_episode()
+
+
+def set_transform_camera(transform, camera_key: str):
+    for t in _walk_transforms(transform):
+        if hasattr(t, "set_camera_key"):
+            t.set_camera_key(camera_key)
 
 
 def build_color_jitter(args):
@@ -68,15 +97,14 @@ def build_horizontal_flip(args):
     return HorizontalFlipWithActionMirror(args.action_mirror_mask, args.state_mirror_mask)
 
 
-class SAM3AugmentationMarker:
-    """Marker to indicate SAM3 augmentation should be applied (requires frame data)."""
-    def __call__(self, frame):
-        # This is a no-op transform; actual SAM3 augmentation happens at episode level
-        return frame
-
-
 def build_sam3(args):
-    return SAM3AugmentationMarker()
+    from .sam3_augmentation import SAM3BackgroundCompositor
+
+    return SAM3BackgroundCompositor(
+        feather_radius=args.sam3_feather_radius,
+        brightness_threshold=args.sam3_brightness_threshold,
+        background_history=args.sam3_background_history,
+    )
 
 
 AUGMENTATION_BUILDERS = {
@@ -99,9 +127,108 @@ def build_transform(args):
             raise SystemExit(f"Unknown augmentation: {name}. Available: {list(AUGMENTATION_BUILDERS.keys())}")
         transforms.append(AUGMENTATION_BUILDERS[name](args))
 
+    if not transforms:
+        return None
     if len(transforms) == 1:
         return transforms[0]
     return v2.Compose(transforms)
+
+
+def _parser_defaults(parser):
+    return {action.dest: action.default for action in parser._actions if action.dest != "help"}
+
+
+TIER_PRESETS = {
+    "tier1": {
+        "include_originals": False,
+        "num_passes": 1,
+        "augmentations": [],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 4,
+        "frame_stride_cycle": None,
+        "skip_prefilter": True,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.02,
+        "max_action_jerk": None,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.15,
+        "tail_drop_max": 0,
+    },
+    "tier2": {
+        "include_originals": True,
+        "num_passes": 3,
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "random_erasing", "horizontal_flip"],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 3,
+        "frame_stride_cycle": None,
+        "skip_prefilter": False,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.0188,
+        "max_action_jerk": 0.0138,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.12,
+        "tail_drop_max": 12,
+    },
+    "tier3": {
+        "include_originals": False,
+        "num_passes": 3,
+        "augmentations": [
+            "color_jitter",
+            "gaussian_blur",
+            "sharpness",
+            "random_erasing",
+            "drifting_blob",
+            "static_erasing",
+            "horizontal_flip",
+        ],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 1,
+        "frame_stride_cycle": [2, 3, 4],
+        "skip_prefilter": True,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.03,
+        "max_action_jerk": None,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.10,
+        "tail_drop_max": 12,
+    },
+}
+
+
+def apply_tier_configuration(args, defaults):
+    if not args.tier:
+        return args
+
+    preset = TIER_PRESETS[args.tier]
+    for key, value in preset.items():
+        setattr(args, key, value)
+
+    return args
+
+
+def get_temporal_selector(args, pass_idx: int):
+    if args.frame_stride_cycle:
+        stride = args.frame_stride_cycle[pass_idx % len(args.frame_stride_cycle)]
+    else:
+        stride = args.keep_every_n
+
+    if stride is None or stride <= 1:
+        return None
+
+    offset = pass_idx % stride
+    return FrameStride(keep_every_n=stride, start_offset=offset)
+
+
+def _normalize_value(value):
+    if isinstance(value, torch.Tensor):
+        value = value.numpy()
+    return value
 
 
 def _episode_record(episodes, ep_idx: int):
@@ -117,23 +244,91 @@ def get_episode_range(source, ep_idx):
     return ep["dataset_from_index"], ep["dataset_to_index"]
 
 
-def build_frame_dict(item, feature_keys, features_meta):
+def build_frame_dict(item, feature_keys, features_meta, action_override=None):
     frame = {"task": item.get("task", "robot manipulation")}
     for key in feature_keys:
         if key in {"timestamp", "index", "episode_index", "frame_index", "task_index"}:
             continue
-        if key in item:
+        if key == "action" and action_override is not None:
+            val = action_override
+        elif key in item:
             val = item[key]
-            if isinstance(val, torch.Tensor):
-                val = val.numpy()
-            if hasattr(val, "ndim") and val.ndim == 3 and val.shape[0] == 3:
-                val = np.transpose(val, (1, 2, 0))
-            if key in features_meta:
-                expected_shape = tuple(features_meta[key]["shape"])
-                if getattr(val, "ndim", None) == 0 and expected_shape == (1,):
-                    val = val.reshape(1)
-            frame[key] = val
+        else:
+            continue
+
+        val = _normalize_value(val)
+        if hasattr(val, "ndim") and val.ndim == 3 and val.shape[0] == 3:
+            val = np.transpose(val, (1, 2, 0))
+        if key in features_meta:
+            expected_shape = tuple(features_meta[key]["shape"])
+            if getattr(val, "ndim", None) == 0 and expected_shape == (1,):
+                val = val.reshape(1)
+        frame[key] = val
     return frame
+
+
+def write_episode(
+    source,
+    output,
+    ep_idx,
+    feature_keys,
+    camera_keys,
+    features_meta,
+    action_shift=0,
+    temporal_selector=None,
+    transform=None,
+    flip=None,
+    tail_drop_max=0,
+):
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+    tail_drop = int(np.random.randint(0, tail_drop_max + 1)) if tail_drop_max > 0 else 0
+    effective_to_idx = to_idx - action_shift - tail_drop
+
+    if effective_to_idx <= from_idx:
+        return
+
+    if transform is not None:
+        reset_transform_state(transform)
+
+    if isinstance(transform, (StaticErasing, DriftingBlob)):
+        first = source[from_idx]
+        for cam_key in camera_keys:
+            if cam_key in first:
+                _, h, w = first[cam_key].shape
+                transform.resample(h, w)
+                break
+
+    for local_idx, global_idx in enumerate(range(from_idx, effective_to_idx)):
+        if temporal_selector is not None and not temporal_selector.should_keep(local_idx):
+            continue
+
+        item = dict(source[global_idx])
+        action_override = None
+
+        if action_shift:
+            future_item = source[global_idx + action_shift]
+            if "action" in future_item:
+                action_override = future_item["action"]
+
+        for cam_key in camera_keys:
+            if cam_key in item:
+                if flip is not None:
+                    item[cam_key] = flip.flip_image(item[cam_key])
+                if transform is not None:
+                    set_transform_camera(transform, cam_key)
+                    item[cam_key] = transform(item[cam_key])
+
+        if flip is not None:
+            if action_override is not None:
+                action_override = flip.mirror_actions(action_override)
+            elif "action" in item:
+                item["action"] = flip.mirror_actions(item["action"])
+            if "observation.state" in item:
+                item["observation.state"] = flip.mirror_state(item["observation.state"])
+
+        output.add_frame(build_frame_dict(item, feature_keys, features_meta, action_override=action_override))
+
+    output.save_episode()
 
 
 def copy_episode(source, output, ep_idx, feature_keys, features_meta):
@@ -190,16 +385,32 @@ def augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera
     output.save_episode()
 
 
-def parse_args():
+def build_parser():
     parser = argparse.ArgumentParser(description="Augment a LeRobot v3 dataset and push to Hugging Face Hub")
 
     parser.add_argument("--source", required=True, help="Source dataset repo_id (e.g. lerobot/aloha_static_cups_open)")
     parser.add_argument("--output", required=True, help="Output dataset repo_id (e.g. user/dataset_augmented)")
+    parser.add_argument("--tier", choices=list(TIER_PRESETS.keys()), default=None, help="Tier preset: tier1, tier2, or tier3")
     parser.add_argument("--num-passes", type=int, default=2, help="Number of augmented copies per episode")
-    parser.add_argument("--augmentations", nargs="+", default=["color_jitter"], choices=list(AUGMENTATION_BUILDERS.keys()))
+    parser.add_argument("--augmentations", nargs="*", default=None, choices=list(AUGMENTATION_BUILDERS.keys()))
     parser.add_argument("--include-originals", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--episodes", nargs="+", type=int, default=None)
+    parser.add_argument("--action-shift", type=int, default=0, help="Shift action labels forward by this many frames")
+    parser.add_argument("--keep-every-n", type=int, default=1, help="Keep every Nth frame for temporal downsampling")
+    parser.add_argument(
+        "--tail-drop-max",
+        type=int,
+        default=0,
+        help="Randomly drop up to this many trailing frames per output episode to preserve length diversity",
+    )
+    parser.add_argument(
+        "--frame-stride-cycle",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Cycle through different keep-every-N values across passes",
+    )
 
     parser.add_argument("--brightness", nargs=2, type=float, default=[0.8, 1.2])
     parser.add_argument("--contrast", nargs=2, type=float, default=[0.8, 1.2])
@@ -229,17 +440,41 @@ def parse_args():
     
     # Pre-filtering options
     parser.add_argument("--skip-prefilter", action="store_true", help="Skip pre-filtering (SPARC + saturation)")
+    parser.add_argument("--prefilter-mode", choices=["full", "fast"], default="full", help="Use a fast sampled prefilter path")
+    parser.add_argument("--prefilter-sample-every-n", type=int, default=1, help="Sample every Nth frame in fast prefilter mode")
     parser.add_argument("--sparc-threshold", type=float, default=-10.0, help="SPARC threshold for smoothness")
     parser.add_argument("--saturation-threshold", type=float, default=0.15, help="Max saturation fraction")
+    parser.add_argument("--min-action-delta", type=float, default=0.02, help="Minimum mean absolute action delta to keep an episode")
+    parser.add_argument(
+        "--max-action-jerk",
+        type=float,
+        default=None,
+        help="Maximum mean absolute second-order action difference to keep an episode",
+    )
     
     # SAM3 augmentation options
     parser.add_argument("--skip-sam3", action="store_true", help="Skip SAM3 background augmentation")
+    parser.add_argument("--sam3-feather-radius", type=int, default=10, help="Feather radius for SAM3 compositing edges")
+    parser.add_argument("--sam3-brightness-threshold", type=int, default=100, help="Fallback mask threshold when SAM3 predictor is unavailable")
+    parser.add_argument("--sam3-background-history", type=int, default=24, help="Number of recent frames to use as SAM3 background candidates")
 
-    return parser.parse_args()
+    return parser
+
+
+def parse_args():
+    parser = build_parser()
+    args = parser.parse_args()
+    defaults = _parser_defaults(parser)
+    if args.augmentations is None:
+        args.augmentations = ["color_jitter"]
+    if args.skip_sam3:
+        args.augmentations = [a for a in args.augmentations if a != "sam3"]
+    return args, defaults
 
 
 def main():
-    args = parse_args()
+    args, defaults = parse_args()
+    apply_tier_configuration(args, defaults)
     t0 = time.time()
 
     if args.seed is not None:
@@ -272,6 +507,10 @@ def main():
             episode_indices=episode_indices,
             sparc_threshold=args.sparc_threshold,
             saturation_threshold_frac=args.saturation_threshold,
+            min_action_delta=args.min_action_delta,
+            max_action_jerk=args.max_action_jerk,
+            mode=args.prefilter_mode,
+            sample_every_n=args.prefilter_sample_every_n,
             fps=source.fps,
         )
         
@@ -287,6 +526,17 @@ def main():
     print(f"  Frames: {source.meta.total_frames}, FPS: {source.fps}")
     print(f"  Cameras: {camera_keys}")
     print(f"  Robot: {source.meta.robot_type}")
+    if args.tier:
+        print(f"  Tier: {args.tier}")
+        print(f"  Action shift: {args.action_shift}")
+        print(f"  Keep every N: {args.keep_every_n}")
+        print(f"  Tail drop max: {args.tail_drop_max}")
+        print(f"  Prefilter mode: {args.prefilter_mode}")
+        print(f"  Prefilter sample every N: {args.prefilter_sample_every_n}")
+        print(f"  Min action delta: {args.min_action_delta}")
+        print(f"  Max action jerk: {args.max_action_jerk}")
+        if args.frame_stride_cycle:
+            print(f"  Frame stride cycle: {args.frame_stride_cycle}")
 
     n_original = len(episode_indices) if args.include_originals else 0
     n_augmented = len(episode_indices) * args.num_passes
@@ -315,15 +565,24 @@ def main():
         if args.include_originals:
             print("\nCopying original episodes...")
             for ep_idx in tqdm(episode_indices, desc="Originals"):
-                copy_episode(source, output, ep_idx, feature_keys, features_meta)
+                write_episode(
+                    source,
+                    output,
+                    ep_idx,
+                    feature_keys,
+                    camera_keys,
+                    features_meta,
+                    action_shift=args.action_shift,
+                    tail_drop_max=args.tail_drop_max,
+                )
 
-        use_decimation = "frame_decimate" in args.augmentations
+        use_frame_decimate = "frame_decimate" in args.augmentations
         use_flip = "horizontal_flip" in args.augmentations
         image_augmentations = [a for a in args.augmentations if a not in ("frame_decimate", "horizontal_flip")]
 
-        if use_decimation:
-            decimator = build_frame_decimate(args)
-            print(f"\nFrame decimation: {decimator}")
+        if use_frame_decimate:
+            frame_decimator = build_frame_decimate(args)
+            print(f"\nFrame decimation: {frame_decimator}")
 
         if use_flip:
             flip = build_horizontal_flip(args)
@@ -335,37 +594,33 @@ def main():
             transform = build_transform(args)
             args.augmentations = saved
             print(f"Image transform: {transform}")
+        else:
+            transform = None
 
         for pass_idx in range(args.num_passes):
             if args.seed is not None:
                 torch.manual_seed(args.seed + pass_idx + 1)
 
+            temporal_selector = get_temporal_selector(args, pass_idx)
+            if temporal_selector is None and use_frame_decimate:
+                temporal_selector = frame_decimator
+            if temporal_selector is not None:
+                print(f"Temporal selector pass {pass_idx + 1}: {temporal_selector}")
+
             for ep_idx in tqdm(episode_indices, desc=f"Pass {pass_idx + 1}/{args.num_passes}"):
-                if use_decimation and not image_augmentations and not use_flip:
-                    decimate_episode(source, output, ep_idx, decimator, feature_keys, features_meta)
-                elif use_flip and not use_decimation and not image_augmentations:
-                    augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera_keys, features_meta)
-                elif not use_decimation and not use_flip and image_augmentations:
-                    augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta)
-                else:
-                    from_idx, to_idx = get_episode_range(source, ep_idx)
-                    for local_idx, global_idx in enumerate(range(from_idx, to_idx)):
-                        if use_decimation and not decimator.should_keep(local_idx):
-                            continue
-                        item = source[global_idx]
-                        for cam_key in camera_keys:
-                            if cam_key in item:
-                                if use_flip:
-                                    item[cam_key] = flip.flip_image(item[cam_key])
-                                if image_augmentations:
-                                    item[cam_key] = transform(item[cam_key])
-                        if use_flip:
-                            if "action" in item:
-                                item["action"] = flip.mirror_actions(item["action"])
-                            if "observation.state" in item:
-                                item["observation.state"] = flip.mirror_state(item["observation.state"])
-                        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
-                    output.save_episode()
+                write_episode(
+                    source,
+                    output,
+                    ep_idx,
+                    feature_keys,
+                    camera_keys,
+                    features_meta,
+                    action_shift=args.action_shift,
+                    temporal_selector=temporal_selector,
+                    transform=transform,
+                    flip=flip if use_flip else None,
+                    tail_drop_max=args.tail_drop_max,
+                )
 
         print("\nFinalizing dataset...")
         output.finalize()

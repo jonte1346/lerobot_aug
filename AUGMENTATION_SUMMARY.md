@@ -10,12 +10,36 @@
 - **Action Coverage**: 67-100% non-zero across joints
 - **Visualizer**: https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_augmented_demo%2Fepisode_0
 
-### 2. **jgiegold/aloha_augmented_v2** 🔄 In Progress (~234 min)
+### 2. **jgiegold/aloha_tier1_diag** ✅ Complete
+- **Status**: Ready in visualizer
+- **Episodes**: 1
+- **Frames**: 99
+- **Tier**: tier1
+- **Key changes**: action shift +4, keep every 4th frame, no full prefilter scan
+- **Visualizer**: https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_tier1_diag%2Fepisode_0
+
+### 3. **jgiegold/aloha_tier2_diag** ✅ Complete
+- **Status**: Ready in visualizer
+- **Episodes**: 2
+- **Frames**: 264
+- **Tier**: tier2
+- **Key changes**: action shift +4, keep every 3rd frame, color jitter + blur + sharpness + erasing + horizontal flip
+- **Visualizer**: https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_tier2_diag%2Fepisode_0
+
+### 4. **jgiegold/aloha_tier3_diag** ✅ Complete
+- **Status**: Ready in visualizer
+- **Episodes**: 3
+- **Frames**: 429
+- **Tier**: tier3
+- **Key changes**: action shift +4, stride cycle 2/3/4, drifting blob + static erasing + horizontal flip
+- **Visualizer**: https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_tier3_diag%2Fepisode_0
+
+### 5. **jgiegold/aloha_augmented_v2** 🔄 In Progress (~234 min)
 - **Episodes**: 5 source → ~29 total (5 original + 5×3 augmented)
 - **Augmentations**: color_jitter, gaussian_blur, sharpness, random_erasing
 - **Strategy**: Balanced coverage with 3 augmentation passes per episode
 
-### 3. **jgiegold/aloha_augmented_best** 🔄 In Progress (~130 min)
+### 6. **jgiegold/aloha_augmented_best** 🔄 In Progress (~130 min)
 - **Episodes**: 10 source → ~50 total (10 original + 10×4 augmented)
 - **Augmentations**: color_jitter, gaussian_blur, sharpness, random_erasing, drifting_blob
 - **Strategy**: Maximum diversity with 4 augmentation passes per episode
