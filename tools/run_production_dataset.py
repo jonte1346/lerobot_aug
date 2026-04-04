@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,12 +9,9 @@ from huggingface_hub import HfApi
 
 
 def main() -> int:
+    """Build and upload the production no-SAM smooth dataset recipe."""
     repo_root = Path(__file__).resolve().parents[1]
-    output_repo = "jgiegold/aloha_balanced_v5_motor5"
-    cache_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / output_repo
-
-    if cache_dir.exists():
-        shutil.rmtree(cache_dir)
+    output_repo = os.getenv("OUTPUT_REPO", "jgiegold/aloha_balanced_v7_motor5_nosam_smooth")
 
     run_cmd = [
         sys.executable,
@@ -66,6 +62,15 @@ def main() -> int:
         "0.15",
         "--action-noise-std",
         "0.003",
+        "--action-smoothing",
+        "savgol",
+        "--savgol-window-length",
+        "7",
+        "--savgol-polyorder",
+        "2",
+        "--smooth-exclude-indices",
+        "6",
+        "13",
         "--sparc-threshold",
         "-10.0",
         "--saturation-threshold",
@@ -93,7 +98,7 @@ def main() -> int:
         folder_path=str(local_dir),
         repo_id=repo_id,
         repo_type="dataset",
-        commit_message="Upload corrected Tier 2 motor dataset",
+        commit_message="Upload production no-SAM smoothed Tier 2 motor dataset",
     )
     print(f"Done: https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2F{repo_id.replace('/', '%2F')}%2Fepisode_0")
     return 0

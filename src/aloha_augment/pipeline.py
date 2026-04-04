@@ -312,6 +312,92 @@ def _add_action_noise(action, std: float):
     return action + np.random.normal(0.0, std, size=action.shape).astype(action.dtype)
 
 
+def _smooth_action_sequence(actions, method: str, window_length: int, polyorder: int, exclude_indices=None):
+    if method == "none" or not actions:
+        return actions
+
+    if any(a is None for a in actions):
+        return actions
+
+    if method != "savgol":
+        raise SystemExit(f"Error: unsupported action smoothing method: {method}")
+
+    try:
+        from scipy.signal import savgol_filter
+    except Exception as exc:
+        raise SystemExit("Error: scipy is required for --action-smoothing savgol. Install optional pipeline deps with scipy.") from exc
+
+    exclude_indices = sorted(set(exclude_indices or []))
+    first = actions[0]
+
+    n_steps = len(actions)
+    if n_steps < 3:
+        return actions
+
+    effective_window = min(int(window_length), n_steps)
+    if effective_window % 2 == 0:
+        effective_window -= 1
+    if effective_window <= polyorder:
+        effective_window = polyorder + 1
+        if effective_window % 2 == 0:
+            effective_window += 1
+    if effective_window > n_steps:
+        effective_window = n_steps if n_steps % 2 == 1 else n_steps - 1
+    if effective_window <= polyorder or effective_window < 3:
+        return actions
+
+    if isinstance(first, torch.Tensor):
+        stacked = torch.stack(actions, dim=0)
+        dtype = stacked.dtype
+        smoothed = stacked.to(dtype=torch.float32).cpu().numpy()
+        dim = smoothed.shape[1] if smoothed.ndim >= 2 else 0
+        smooth_mask = np.ones(dim, dtype=bool)
+        for idx in exclude_indices:
+            if 0 <= idx < dim:
+                smooth_mask[idx] = False
+
+        if np.any(smooth_mask):
+            smoothed[:, smooth_mask] = savgol_filter(
+                smoothed[:, smooth_mask],
+                window_length=effective_window,
+                polyorder=polyorder,
+                axis=0,
+                mode="interp",
+            )
+
+        smoothed_t = torch.from_numpy(smoothed).to(dtype=dtype)
+        return [smoothed_t[t] for t in range(smoothed_t.shape[0])]
+
+    stacked = np.stack(actions, axis=0).astype(np.float32, copy=False)
+    smoothed = stacked.copy()
+    dim = smoothed.shape[1] if smoothed.ndim >= 2 else 0
+    smooth_mask = np.ones(dim, dtype=bool)
+    for idx in exclude_indices:
+        if 0 <= idx < dim:
+            smooth_mask[idx] = False
+
+    if np.any(smooth_mask):
+        smoothed[:, smooth_mask] = savgol_filter(
+            smoothed[:, smooth_mask],
+            window_length=effective_window,
+            polyorder=polyorder,
+            axis=0,
+            mode="interp",
+        )
+
+    smoothed = smoothed.astype(actions[0].dtype, copy=False)
+    return [smoothed[t] for t in range(smoothed.shape[0])]
+
+
+def resolve_smoothing_exclude_indices(args):
+    if args.smooth_exclude_indices is not None:
+        return args.smooth_exclude_indices
+    if args.robot_type == "aloha":
+        # ALOHA gripper dimensions are binary-like and should not be low-pass filtered.
+        return [6, 13]
+    return []
+
+
 def write_episode(
     source,
     output,
@@ -326,6 +412,10 @@ def write_episode(
     tail_drop_max=0,
     temporal_jitter_pct=0.0,
     action_noise_std=0.0,
+    action_smoothing="none",
+    savgol_window_length=7,
+    savgol_polyorder=2,
+    smooth_exclude_indices=None,
 ):
     from_idx, to_idx = get_episode_range(source, ep_idx)
     tail_drop = int(np.random.randint(0, tail_drop_max + 1)) if tail_drop_max > 0 else 0
@@ -356,6 +446,31 @@ def write_episode(
     if usable_len <= 0:
         return
 
+    planned_actions = []
+    for out_idx in range(usable_len):
+        obs_pos = float(positions[out_idx])
+        obs_seq_idx = int(round(obs_pos))
+        obs_seq_idx = max(0, min(obs_seq_idx, n_selected - 1))
+        global_idx = selected_indices[obs_seq_idx]
+        item = source[global_idx]
+
+        action_override = None
+        if effective_shift:
+            action_pos = float(positions[out_idx + effective_shift])
+            action_override = _interp_key_at_pos(source, selected_indices, action_pos, "action")
+        elif "action" in item:
+            action_override = item["action"]
+
+        planned_actions.append(action_override)
+
+    planned_actions = _smooth_action_sequence(
+        planned_actions,
+        method=action_smoothing,
+        window_length=savgol_window_length,
+        polyorder=savgol_polyorder,
+        exclude_indices=smooth_exclude_indices,
+    )
+
     if transform is not None:
         reset_transform_state(transform)
 
@@ -374,13 +489,7 @@ def write_episode(
         global_idx = selected_indices[obs_seq_idx]
 
         item = dict(source[global_idx])
-        action_override = None
-
-        if effective_shift:
-            action_pos = float(positions[out_idx + effective_shift])
-            action_override = _interp_key_at_pos(source, selected_indices, action_pos, "action")
-        elif "action" in item:
-            action_override = item["action"]
+        action_override = planned_actions[out_idx]
 
         if temporal_jitter_pct > 0.0:
             interp_state = _interp_key_at_pos(source, selected_indices, obs_pos, "observation.state")
@@ -523,6 +632,31 @@ def build_parser():
         default=0.0,
         help="Per-episode temporal length jitter fraction in [0,1] (e.g. 0.15 for +/-15%)",
     )
+    parser.add_argument(
+        "--action-smoothing",
+        choices=["none", "savgol"],
+        default="none",
+        help="Optional low-pass smoothing for action trajectories",
+    )
+    parser.add_argument(
+        "--savgol-window-length",
+        type=int,
+        default=7,
+        help="Savitzky-Golay window length (odd integer, auto-clamped per episode)",
+    )
+    parser.add_argument(
+        "--savgol-polyorder",
+        type=int,
+        default=2,
+        help="Savitzky-Golay polynomial order",
+    )
+    parser.add_argument(
+        "--smooth-exclude-indices",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Action dimensions to exclude from smoothing (defaults include ALOHA grippers)",
+    )
 
     parser.add_argument("--robot-type", type=str, default=None, choices=list(ROBOT_PRESETS.keys()))
     parser.add_argument("--action-mirror-mask", nargs="+", type=float, default=None)
@@ -567,6 +701,10 @@ def parse_args():
         args.augmentations = [a for a in args.augmentations if a != "sam3"]
     if args.temporal_jitter_pct < 0 or args.temporal_jitter_pct > 1:
         raise SystemExit("Error: --temporal-jitter-pct must be in [0, 1].")
+    if args.savgol_window_length < 3:
+        raise SystemExit("Error: --savgol-window-length must be >= 3.")
+    if args.savgol_polyorder < 1:
+        raise SystemExit("Error: --savgol-polyorder must be >= 1.")
     return args, defaults
 
 
@@ -634,6 +772,10 @@ def main():
         print(f"  Min action delta: {args.min_action_delta}")
         print(f"  Max action jerk: {args.max_action_jerk}")
         print(f"  Action noise std: {args.action_noise_std}")
+        print(f"  Action smoothing: {args.action_smoothing}")
+        if args.action_smoothing == "savgol":
+            print(f"  Savgol window length: {args.savgol_window_length}")
+            print(f"  Savgol polyorder: {args.savgol_polyorder}")
         print(f"  Temporal jitter pct: {args.temporal_jitter_pct}")
         if args.frame_stride_cycle:
             print(f"  Frame stride cycle: {args.frame_stride_cycle}")
@@ -685,6 +827,10 @@ def main():
                     tail_drop_max=args.tail_drop_max,
                     temporal_jitter_pct=0.0,
                     action_noise_std=0.0,
+                    action_smoothing="none",
+                    savgol_window_length=args.savgol_window_length,
+                    savgol_polyorder=args.savgol_polyorder,
+                    smooth_exclude_indices=resolve_smoothing_exclude_indices(args),
                 )
 
         use_frame_decimate = "frame_decimate" in args.augmentations
@@ -738,6 +884,10 @@ def main():
                     tail_drop_max=args.tail_drop_max,
                     temporal_jitter_pct=args.temporal_jitter_pct,
                     action_noise_std=args.action_noise_std,
+                    action_smoothing=args.action_smoothing,
+                    savgol_window_length=args.savgol_window_length,
+                    savgol_polyorder=args.savgol_polyorder,
+                    smooth_exclude_indices=resolve_smoothing_exclude_indices(args),
                 )
 
         print("\nFinalizing dataset...")

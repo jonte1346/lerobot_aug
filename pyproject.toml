@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-pipeline = ["lerobot>=0.4.4", "torch", "torchvision", "tqdm"]
+pipeline = ["lerobot>=0.4.4", "torch", "torchvision", "tqdm", "scipy"]
 dev = ["pytest"]
 
 [project.scripts]
