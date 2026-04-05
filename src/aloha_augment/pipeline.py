@@ -104,6 +104,9 @@ def build_sam3(args):
         feather_radius=args.sam3_feather_radius,
         brightness_threshold=args.sam3_brightness_threshold,
         background_history=args.sam3_background_history,
+        top_masks=getattr(args, "sam3_top_masks", 4),
+        mask_iou_threshold=getattr(args, "sam3_mask_iou_threshold", 0.75),
+        text_prompt=getattr(args, "sam3_text_prompt", "plastic cup, lid, robot hand"),
     )
 
 
@@ -120,9 +123,11 @@ AUGMENTATION_BUILDERS = {
 }
 
 
-def build_transform(args):
+def build_transform(args, augmentations=None):
+    if augmentations is None:
+        augmentations = args.augmentations
     transforms = []
-    for name in args.augmentations:
+    for name in augmentations:
         if name not in AUGMENTATION_BUILDERS:
             raise SystemExit(f"Unknown augmentation: {name}. Available: {list(AUGMENTATION_BUILDERS.keys())}")
         transforms.append(AUGMENTATION_BUILDERS[name](args))
@@ -197,6 +202,81 @@ TIER_PRESETS = {
         "sparc_threshold": -10.0,
         "saturation_threshold": 0.10,
         "tail_drop_max": 12,
+    },
+    # Canonical recipe for jgiegold/aloha_balanced_v7
+    "v7": {
+        "include_originals": True,
+        "include_originals_decimated": True,
+        "num_passes": 1,
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "random_erasing", "horizontal_flip"],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 3,
+        "frame_stride_cycle": None,
+        "skip_prefilter": False,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.015,
+        "max_action_jerk": 0.0145,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.12,
+        "tail_drop_max": 8,
+        "temporal_jitter_pct": 0.15,
+        "action_noise_std": 0.003,
+        "action_smoothing": "savgol",
+        "savgol_window_length": 7,
+        "savgol_polyorder": 2,
+        "smooth_exclude_indices": [6, 13],
+    },
+    # v7 + SAM3 text-prompted background compositing (requires transformers with Sam3Model)
+    "v8": {
+        "include_originals": True,
+        "include_originals_decimated": True,
+        "num_passes": 1,
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "random_erasing", "horizontal_flip", "sam3"],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 3,
+        "frame_stride_cycle": None,
+        "skip_prefilter": False,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.015,
+        "max_action_jerk": 0.0145,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.12,
+        "tail_drop_max": 8,
+        "temporal_jitter_pct": 0.15,
+        "action_noise_std": 0.003,
+        "action_smoothing": "savgol",
+        "savgol_window_length": 7,
+        "savgol_polyorder": 2,
+        "smooth_exclude_indices": [6, 13],
+    },
+    # v7 + SAM2 background compositing (requires sam2 package)
+    "v7_sam": {
+        "include_originals": True,
+        "include_originals_decimated": True,
+        "num_passes": 1,
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "random_erasing", "horizontal_flip", "sam3"],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 3,
+        "frame_stride_cycle": None,
+        "skip_prefilter": False,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.015,
+        "max_action_jerk": 0.0145,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.12,
+        "tail_drop_max": 8,
+        "temporal_jitter_pct": 0.15,
+        "action_noise_std": 0.003,
+        "action_smoothing": "savgol",
+        "savgol_window_length": 7,
+        "savgol_polyorder": 2,
+        "smooth_exclude_indices": [6, 13],
     },
 }
 
@@ -278,8 +358,6 @@ def build_frame_dict(item, feature_keys, features_meta, action_override=None):
 
 
 def _lerp_value(v0, v1, alpha: float):
-    if isinstance(v0, torch.Tensor):
-        return v0 * (1.0 - alpha) + v1 * alpha
     return v0 * (1.0 - alpha) + v1 * alpha
 
 
@@ -519,60 +597,6 @@ def write_episode(
     output.save_episode()
 
 
-def copy_episode(source, output, ep_idx, feature_keys, features_meta):
-    from_idx, to_idx = get_episode_range(source, ep_idx)
-    for global_idx in range(from_idx, to_idx):
-        item = source[global_idx]
-        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
-    output.save_episode()
-
-
-def decimate_episode(source, output, ep_idx, decimator, feature_keys, features_meta):
-    from_idx, to_idx = get_episode_range(source, ep_idx)
-    for local_idx, global_idx in enumerate(range(from_idx, to_idx)):
-        if not decimator.should_keep(local_idx):
-            continue
-        item = source[global_idx]
-        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
-    output.save_episode()
-
-
-def augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta):
-    from_idx, to_idx = get_episode_range(source, ep_idx)
-
-    if isinstance(transform, (StaticErasing, DriftingBlob)):
-        first = source[from_idx]
-        for cam_key in camera_keys:
-            if cam_key in first:
-                _, h, w = first[cam_key].shape
-                transform.resample(h, w)
-                break
-
-    for global_idx in range(from_idx, to_idx):
-        item = source[global_idx]
-        for cam_key in camera_keys:
-            if cam_key in item:
-                item[cam_key] = transform(item[cam_key])
-        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
-    output.save_episode()
-
-
-def augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera_keys, features_meta):
-    from_idx, to_idx = get_episode_range(source, ep_idx)
-
-    for global_idx in range(from_idx, to_idx):
-        item = source[global_idx]
-        for cam_key in camera_keys:
-            if cam_key in item:
-                item[cam_key] = flip.flip_image(item[cam_key])
-        if "action" in item:
-            item["action"] = flip.mirror_actions(item["action"])
-        if "observation.state" in item:
-            item["observation.state"] = flip.mirror_state(item["observation.state"])
-        output.add_frame(build_frame_dict(item, feature_keys, features_meta))
-    output.save_episode()
-
-
 def build_parser():
     parser = argparse.ArgumentParser(description="Augment a LeRobot v3 dataset and push to Hugging Face Hub")
 
@@ -687,6 +711,9 @@ def build_parser():
     parser.add_argument("--sam3-feather-radius", type=int, default=10, help="Feather radius for SAM3 compositing edges")
     parser.add_argument("--sam3-brightness-threshold", type=int, default=100, help="Fallback mask threshold when SAM3 predictor is unavailable")
     parser.add_argument("--sam3-background-history", type=int, default=24, help="Number of recent frames to use as SAM3 background candidates")
+    parser.add_argument("--sam3-top-masks", type=int, default=4, help="Number of largest SAM2 masks to union as foreground")
+    parser.add_argument("--sam3-mask-iou-threshold", type=float, default=0.75, help="Minimum predicted_iou to include a SAM2 mask in the foreground")
+    parser.add_argument("--sam3-text-prompt", type=str, default="plastic cup, lid, robot hand", help="Comma-separated text prompt for SAM3 object segmentation")
 
     return parser
 
@@ -846,10 +873,7 @@ def main():
             print(f"Horizontal flip: {flip}")
 
         if image_augmentations:
-            saved = args.augmentations
-            args.augmentations = image_augmentations
-            transform = build_transform(args)
-            args.augmentations = saved
+            transform = build_transform(args, image_augmentations)
             print(f"Image transform: {transform}")
         else:
             transform = None

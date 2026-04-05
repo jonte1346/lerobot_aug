@@ -64,12 +64,12 @@ uv run aloha-augment \
   --video-backend pyav
 ```
 
-Production v7 recipe (no SAM, smoothed):
+Production v7 recipe:
 
 ```bash
 uv run --with scipy aloha-augment \
   --source lerobot/aloha_static_cups_open \
-  --output your-username/aloha_balanced_v7_motor5_nosam_smooth \
+  --output your-username/aloha_balanced_v7 \
   --episodes 0 1 2 3 4 5 6 7 8 9 \
   --num-passes 1 \
   --include-originals \
@@ -103,13 +103,13 @@ Use `--no-push` to skip uploading to HF Hub and `--force` to overwrite the local
 
 The reusable production helper lives in `tools/` because it is operational automation, not part of the package API.
 
-- Canonical runner: `tools/run_production_dataset.py`
+- Canonical runner: `tools/run_production_dataset_v7.py`
 
 Example:
 
 ```bash
 $env:HF_TOKEN="your_token"
-uv run --with scipy python tools/run_production_dataset.py
+uv run --with scipy python tools/run_production_dataset_v7.py
 ```
 
 ## Available augmentations
@@ -141,6 +141,6 @@ src/aloha_augment/
   transforms.py      # Custom transforms
   explore_dataset.py # Dataset inspection helper
 tools/
-  run_production_dataset.py # Canonical production build+upload helper
+  run_production_dataset_v7.py # Canonical production build+upload helper
 environment.yml      # Conda environment
 ```

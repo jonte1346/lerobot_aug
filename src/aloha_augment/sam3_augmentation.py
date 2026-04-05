@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from pathlib import Path
+from collections import deque
 from typing import Optional
 import torch
 
@@ -148,23 +148,47 @@ def augment_episode_with_sam3(
     return augmented
 
 
-def get_sam3_predictor():
+def get_sam3_model():
     """
-    Initialize SAM3 video predictor if available.
-    
-    Returns SAM3 predictor or None if not installed.
+    Load SAM3 (text-prompted) from transformers if available.
+
+    Returns (Sam3Model, Sam3Processor) or (None, None).
     """
     try:
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        from transformers import Sam3Model, Sam3Processor
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        sam2_checkpoint = "facebook/sam2-hiera-large"
-        model_cfg = "sam2_hiera_l.yaml"
-        predictor = SAM2ImagePredictor.from_pretrained(sam2_checkpoint, model_cfg, device=device)
-        return predictor
+        model = Sam3Model.from_pretrained("facebook/sam3").to(device)
+        processor = Sam3Processor.from_pretrained("facebook/sam3")
+        return model, processor
+    except ImportError:
+        return None, None
+    except OSError as e:
+        msg = str(e)
+        if "gated" in msg or "403" in msg or "restricted" in msg:
+            print(f"Warning: SAM3 access denied (gated repo) — request access at https://huggingface.co/facebook/sam3. Falling back.")
+        else:
+            print(f"Warning: Could not load SAM3 (OSError): {e}")
+        return None, None
+    except Exception as e:
+        print(f"Warning: Could not load SAM3: {e}")
+        return None, None
+
+
+def get_sam3_predictor():
+    """
+    Load SAM2 automatic mask generator as fallback if SAM3 is unavailable.
+
+    Returns SAM2AutomaticMaskGenerator or None.
+    """
+    try:
+        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SAM2AutomaticMaskGenerator.from_pretrained("facebook/sam2-hiera-large", device=device)
+        return model
     except ImportError:
         return None
     except Exception as e:
-        print(f"Warning: Could not load SAM3: {e}")
+        print(f"Warning: Could not load SAM2: {e}")
         return None
 
 
@@ -203,21 +227,44 @@ def _from_numpy_like(arr: np.ndarray, like):
 
 
 class SAM3BackgroundCompositor:
-    """Episode-aware background compositing with SAM3 predictor fallback."""
+    """Episode-aware background compositing.
+
+    Mask prediction priority:
+      1. SAM3 (transformers, text-prompted) — most accurate
+      2. SAM2 automatic mask generator — prompt-free fallback
+      3. Brightness heuristic — always available
+    Only one of SAM3 / SAM2 is loaded to avoid double GPU memory usage.
+    """
 
     def __init__(
         self,
         feather_radius: int = 10,
         brightness_threshold: int = 100,
         background_history: int = 24,
+        top_masks: int = 4,
+        mask_iou_threshold: float = 0.75,
+        text_prompt: str = "plastic cup, lid, robot hand",
     ):
         self.feather_radius = feather_radius
         self.brightness_threshold = brightness_threshold
         self.background_history = max(1, int(background_history))
-        self.predictor = get_sam3_predictor()
+        self.top_masks = max(1, int(top_masks))
+        self.mask_iou_threshold = float(mask_iou_threshold)
+        self.text_prompt = text_prompt
         self._warned_predictor = False
         self._camera_key = "default"
-        self._history: dict[str, list[np.ndarray]] = {}
+        self._history: dict[str, deque[np.ndarray]] = {}
+
+        # Try SAM3 first; only load SAM2 if SAM3 is unavailable.
+        self._sam3_model, self._sam3_processor = get_sam3_model()
+        self.predictor = None if self._sam3_model is not None else get_sam3_predictor()
+
+        if self._sam3_model is not None:
+            print("SAM3BackgroundCompositor: using SAM3 (text-prompted)")
+        elif self.predictor is not None:
+            print("SAM3BackgroundCompositor: using SAM2 automatic mask generator")
+        else:
+            print("SAM3BackgroundCompositor: using brightness heuristic (no SAM model available)")
 
     def reset_episode(self):
         self._history = {}
@@ -225,21 +272,58 @@ class SAM3BackgroundCompositor:
     def set_camera_key(self, camera_key: str):
         self._camera_key = camera_key
 
+    def _predict_mask_sam3(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """Text-prompted SAM3 segmentation. Returns mask or None on failure."""
+        device = next(self._sam3_model.parameters()).device
+        inputs = self._sam3_processor(
+            images=frame,
+            text=self.text_prompt,
+            return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            outputs = self._sam3_model(**inputs)
+        results = self._sam3_processor.post_process_instance_segmentation(
+            outputs,
+            threshold=0.5,
+            mask_threshold=0.5,
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )
+        if results and results[0].get("masks") is not None:
+            masks = results[0]["masks"]  # bool tensor (N, H, W)
+            if len(masks) > 0:
+                return masks.any(dim=0).cpu().numpy().astype(np.uint8)
+        return None
+
+    def _predict_mask_sam2(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        """SAM2 automatic mask generator. Returns mask or None on failure."""
+        anns = self.predictor.generate(frame)
+        if not anns:
+            return None
+        anns_sorted = sorted(anns, key=lambda x: x["area"], reverse=True)
+        combined = np.zeros(frame.shape[:2], dtype=np.uint8)
+        for ann in anns_sorted[: self.top_masks]:
+            if ann.get("predicted_iou", 1.0) >= self.mask_iou_threshold:
+                combined = np.logical_or(combined, ann["segmentation"]).astype(np.uint8)
+        return combined if combined.any() else None
+
     def _predict_mask(self, frame: np.ndarray) -> np.ndarray:
-        # SAM2/SAM3 API compatibility varies by install; fallback is always available.
-        if self.predictor is not None:
+        if self._sam3_model is not None:
             try:
-                self.predictor.set_image(frame)
-                if hasattr(self.predictor, "predict"):
-                    pred = self.predictor.predict()
-                    if isinstance(pred, tuple) and len(pred) >= 1:
-                        masks = pred[0]
-                        if masks is not None and len(masks) > 0:
-                            m = masks[0]
-                            return (m > 0.5).astype(np.uint8)
-            except Exception as exc:  # pragma: no cover - external predictor variance
+                mask = self._predict_mask_sam3(frame)
+                if mask is not None:
+                    return mask
+            except Exception as exc:
                 if not self._warned_predictor:
-                    print(f"Warning: SAM3 predictor failed, using heuristic mask fallback: {exc}")
+                    print(f"Warning: SAM3 failed, falling back to heuristic: {exc}")
+                    self._warned_predictor = True
+        elif self.predictor is not None:
+            try:
+                mask = self._predict_mask_sam2(frame)
+                if mask is not None:
+                    return mask
+            except Exception as exc:
+                if not self._warned_predictor:
+                    print(f"Warning: SAM2 failed, falling back to heuristic: {exc}")
                     self._warned_predictor = True
 
         return simple_robot_mask_heuristic(frame, brightness_threshold=self.brightness_threshold)
@@ -247,7 +331,7 @@ class SAM3BackgroundCompositor:
     def __call__(self, frame):
         frame_np = _to_numpy_uint8_hwc(frame)
 
-        cam_history = self._history.setdefault(self._camera_key, [])
+        cam_history = self._history.setdefault(self._camera_key, deque(maxlen=self.background_history))
         if cam_history:
             bg = cam_history[np.random.randint(0, len(cam_history))]
         else:
@@ -258,7 +342,5 @@ class SAM3BackgroundCompositor:
         composited = composite_backgrounds(fg_rgba, alpha, [bg])[0]
 
         cam_history.append(frame_np)
-        if len(cam_history) > self.background_history:
-            cam_history.pop(0)
 
         return _from_numpy_like(composited, frame)
