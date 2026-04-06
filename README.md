@@ -144,3 +144,37 @@ tools/
   run_production_dataset_v7.py # Canonical production build+upload helper
 environment.yml      # Conda environment
 ```
+
+## Development with Claude Code
+
+This project was built iteratively with [Claude Code](https://claude.ai/code), Anthropic's
+agentic coding assistant. Claude was used as a collaborative engineering partner throughout:
+
+**Pipeline architecture**
+- Designed the tier preset system (`TIER_PRESETS` in `pipeline.py`) and `apply_tier_configuration`
+- Built the `SAM3BackgroundCompositor` class with three-level mask prediction fallback
+  (EfficientSAM3 → SAM2 → brightness heuristic) and per-camera frame-stride caching
+- Implemented Savitzky-Golay action smoothing with per-dimension gripper exclusion
+
+**Bug diagnosis and fixes**
+- Found that `apply_tier_configuration` was unconditionally overwriting explicit CLI args
+  (e.g. `--keep-every-n 6` was silently reset to the preset value of 3); fixed by comparing
+  against parser defaults before applying
+- Identified that `random_erasing` ran *before* SAM3, painting black rectangles that corrupted
+  mask predictions; removed it from v8/v9 presets
+- Added bad-mask coverage validation (coverage < 1% or > 80%) to fall back to the last good
+  cached mask instead of emitting broken composited frames
+- Debugged Windows-specific issues: `uv run` launcher requirement, cp1252 console encoding
+  rejecting Unicode characters, and PermissionError on cache dirs held by live processes
+
+**Dataset quality iteration (v7 → v8 → v9)**
+- Diagnosed v8's degraded action variance (σ doubled vs v7) as caused by `KEEP_EVERY_N=6`
+  halving episode length and `SAM3_STRIDE=30` causing the mask to lag 0.6s behind arm motion
+- Designed v9 preset: `keep_every_n=1` (full episode), `sam3_frame_stride=5` (0.1s tracking),
+  `sam3_background_history=200` (4s diverse background pool)
+
+**Tooling**
+- Wrote production runner scripts (`tools/run_production_dataset_v8.py`,
+  `tools/run_production_dataset_v9.py`) with env-var overrides and runtime estimates
+- All planning, debugging, and implementation done inside a single Claude Code session with
+  full codebase access and background task execution
