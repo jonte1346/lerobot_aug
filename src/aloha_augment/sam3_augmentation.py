@@ -150,27 +150,35 @@ def augment_episode_with_sam3(
 
 def get_sam3_model():
     """
-    Load SAM3 (text-prompted) from transformers if available.
+    Load EfficientSAM3 (text-prompted, CPU-friendly) from Simon7108528/EfficientSAM3.
 
-    Returns (Sam3Model, Sam3Processor) or (None, None).
+    Returns (model, Sam3Processor) or (None, None).
     """
     try:
-        from transformers import Sam3Model, Sam3Processor
+        from sam3.model_builder import build_efficientsam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor as EfficientSam3Processor
+        from huggingface_hub import hf_hub_download
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-        processor = Sam3Processor.from_pretrained("facebook/sam3")
+        checkpoint_path = hf_hub_download(
+            repo_id="Simon7108528/EfficientSAM3",
+            filename="stage1_all_converted/efficient_sam3_tinyvit_11m_mobileclip_s1.pth",
+        )
+        model = build_efficientsam3_image_model(
+            checkpoint_path=checkpoint_path,
+            backbone_type="tinyvit",
+            model_name="11m",
+            text_encoder_type="MobileCLIP-S1",
+            text_encoder_context_length=77,
+            text_encoder_pos_embed_table_size=77,
+            interpolate_pos_embed=False,
+        ).to(device)
+        processor = EfficientSam3Processor(model)
         return model, processor
     except ImportError:
         return None, None
-    except OSError as e:
-        msg = str(e)
-        if "gated" in msg or "403" in msg or "restricted" in msg:
-            print(f"Warning: SAM3 access denied (gated repo) — request access at https://huggingface.co/facebook/sam3. Falling back.")
-        else:
-            print(f"Warning: Could not load SAM3 (OSError): {e}")
-        return None, None
     except Exception as e:
-        print(f"Warning: Could not load SAM3: {e}")
+        print(f"Warning: Could not load EfficientSAM3: {e}")
         return None, None
 
 
@@ -244,6 +252,7 @@ class SAM3BackgroundCompositor:
         top_masks: int = 4,
         mask_iou_threshold: float = 0.75,
         text_prompt: str = "plastic cup, lid, robot hand",
+        sam3_frame_stride: int = 5,
     ):
         self.feather_radius = feather_radius
         self.brightness_threshold = brightness_threshold
@@ -251,16 +260,20 @@ class SAM3BackgroundCompositor:
         self.top_masks = max(1, int(top_masks))
         self.mask_iou_threshold = float(mask_iou_threshold)
         self.text_prompt = text_prompt
+        self.sam3_frame_stride = max(1, int(sam3_frame_stride))
         self._warned_predictor = False
         self._camera_key = "default"
         self._history: dict[str, deque[np.ndarray]] = {}
+        # Per-camera mask cache for frame-stride reuse
+        self._mask_cache: dict[str, tuple[int, np.ndarray]] = {}  # key → (frame_idx, mask)
+        self._frame_counter: dict[str, int] = {}
 
         # Try SAM3 first; only load SAM2 if SAM3 is unavailable.
         self._sam3_model, self._sam3_processor = get_sam3_model()
         self.predictor = None if self._sam3_model is not None else get_sam3_predictor()
 
         if self._sam3_model is not None:
-            print("SAM3BackgroundCompositor: using SAM3 (text-prompted)")
+            print(f"SAM3BackgroundCompositor: using EfficientSAM3 (text-prompted, stride={self.sam3_frame_stride})")
         elif self.predictor is not None:
             print("SAM3BackgroundCompositor: using SAM2 automatic mask generator")
         else:
@@ -268,30 +281,26 @@ class SAM3BackgroundCompositor:
 
     def reset_episode(self):
         self._history = {}
+        self._mask_cache = {}
+        self._frame_counter = {}
 
     def set_camera_key(self, camera_key: str):
         self._camera_key = camera_key
 
     def _predict_mask_sam3(self, frame: np.ndarray) -> Optional[np.ndarray]:
-        """Text-prompted SAM3 segmentation. Returns mask or None on failure."""
-        device = next(self._sam3_model.parameters()).device
-        inputs = self._sam3_processor(
-            images=frame,
-            text=self.text_prompt,
-            return_tensors="pt",
-        ).to(device)
+        """Text-prompted EfficientSAM3 segmentation. Returns mask or None on failure."""
+        from PIL import Image as PILImage
+        pil_image = PILImage.fromarray(frame)
         with torch.no_grad():
-            outputs = self._sam3_model(**inputs)
-        results = self._sam3_processor.post_process_instance_segmentation(
-            outputs,
-            threshold=0.5,
-            mask_threshold=0.5,
-            target_sizes=inputs.get("original_sizes").tolist(),
-        )
-        if results and results[0].get("masks") is not None:
-            masks = results[0]["masks"]  # bool tensor (N, H, W)
-            if len(masks) > 0:
+            state = self._sam3_processor.set_image(pil_image)
+            state = self._sam3_processor.set_text_prompt(
+                prompt=self.text_prompt, state=state
+            )
+        masks = state.get("masks")
+        if masks is not None and len(masks) > 0:
+            if isinstance(masks, torch.Tensor):
                 return masks.any(dim=0).cpu().numpy().astype(np.uint8)
+            return np.logical_or.reduce(np.asarray(masks)).astype(np.uint8)
         return None
 
     def _predict_mask_sam2(self, frame: np.ndarray) -> Optional[np.ndarray]:
@@ -308,9 +317,23 @@ class SAM3BackgroundCompositor:
 
     def _predict_mask(self, frame: np.ndarray) -> np.ndarray:
         if self._sam3_model is not None:
+            # Reuse cached mask within frame stride to avoid running SAM3 on every frame
+            cam = self._camera_key
+            idx = self._frame_counter.get(cam, 0)
+            self._frame_counter[cam] = idx + 1
+            cached_idx, cached_mask = self._mask_cache.get(cam, (-999, None))
+            if cached_mask is not None and (idx - cached_idx) < self.sam3_frame_stride:
+                return cached_mask
             try:
                 mask = self._predict_mask_sam3(frame)
                 if mask is not None:
+                    coverage = mask.mean()
+                    bad = coverage < 0.01 or coverage > 0.80
+                    if bad and cached_mask is not None:
+                        # Bad mask (occlusion / over-segmentation) — reuse last good mask
+                        return cached_mask
+                    # Good mask, or no cache to fall back to
+                    self._mask_cache[cam] = (idx, mask)
                     return mask
             except Exception as exc:
                 if not self._warned_predictor:

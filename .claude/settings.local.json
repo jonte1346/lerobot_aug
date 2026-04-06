@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Users/jonat/qualia/lerobot_aug/tests -name \"*.py\" -type f -exec grep -l \"copy_episode\\\\|decimate_episode\\\\|augment_episode\\\\|augment_episode_with_flip\" {} \\\\;)",
+      "Bash(grep -n \"from pathlib\\\\|import pathlib\\\\|from pathlib import Path\" /c/Users/jonat/qualia/lerobot_aug/src/aloha_augment/*.py)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://github.com/jonte1346/lerobot_aug)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(.venv/Scripts/python -c \"from sam3.model_builder import build_efficientsam3_image_model; from sam3.model.sam3_image_processor import Sam3Processor; print\\('EfficientSAM3: OK'\\)\")",
+      "Bash(.venv/Scripts/python -c ':*)",
+      "Bash(python -c \"import sam3; import os; print\\(os.path.dirname\\(sam3.__file__\\)\\)\")",
+      "Bash(curl -L \"https://github.com/SimonZeng7108/efficientsam3/raw/main/assets/bpe_simple_vocab_16e6.txt.gz\" -o \"/c/Users/jonat/qualia/lerobot_aug/.venv/Lib/site-packages/sam3/assets/bpe_simple_vocab_16e6.txt.gz\")",
+      "Bash(.venv/Scripts/python -c \"import clip; import os; print\\(os.path.dirname\\(clip.__file__\\)\\)\")",
+      "Bash(.venv/Scripts/python -c \"import open_clip; import os; print\\(os.path.dirname\\(open_clip.__file__\\)\\)\")",
+      "Bash(.venv/Scripts/python -m aloha_augment.pipeline --source lerobot/aloha_static_cups_open --output jgiegold/aloha_balanced_v8_test --episodes 0 1 --tier v8 --sam3-text-prompt \"plastic cup, lid, robot hand\" --sam3-frame-stride 5 --video-backend pyav --force --image-writer-threads 1 --no-push)",
+      "Bash(grep -v \"^$\")",
+      "Bash(taskkill /F /IM python.exe /T)",
+      "Bash(ls -la /c/Users/jonat/qualia/lerobot_aug/tools/*.py)",
+      "Bash(command -v python3)",
+      "Bash(EPISODES=\"0 1 2 3 4 5 6 7 8 9\" SAM3_STRIDE=30 UPLOAD=1 uv run tools/run_production_dataset_v8.py)",
+      "Bash(powershell.exe -Command \"Get-Process python* | Select-Object Id,ProcessName,WorkingSet64 | Format-Table -AutoSize\")",
+      "Bash(powershell.exe -Command \"Get-WmiObject Win32_Process -Filter 'ProcessId=38268' | Select-Object CommandLine | Format-List\")",
+      "Bash(EPISODES=\"0 1 2 3 4 5 6 7 8 9\" SAM3_STRIDE=30 KEEP_EVERY_N=6 WRITER_THREADS=4 UPLOAD=1 uv run tools/run_production_dataset_v8.py)"
+    ]
+  }
+}

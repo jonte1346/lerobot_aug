@@ -107,6 +107,7 @@ def build_sam3(args):
         top_masks=getattr(args, "sam3_top_masks", 4),
         mask_iou_threshold=getattr(args, "sam3_mask_iou_threshold", 0.75),
         text_prompt=getattr(args, "sam3_text_prompt", "plastic cup, lid, robot hand"),
+        sam3_frame_stride=getattr(args, "sam3_frame_stride", 5),
     )
 
 
@@ -233,7 +234,8 @@ TIER_PRESETS = {
         "include_originals": True,
         "include_originals_decimated": True,
         "num_passes": 1,
-        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "random_erasing", "horizontal_flip", "sam3"],
+        # random_erasing omitted: black boxes corrupt SAM3 mask prediction
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "horizontal_flip", "sam3"],
         "robot_type": "aloha",
         "action_shift": 4,
         "keep_every_n": 3,
@@ -258,7 +260,8 @@ TIER_PRESETS = {
         "include_originals": True,
         "include_originals_decimated": True,
         "num_passes": 1,
-        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "random_erasing", "horizontal_flip", "sam3"],
+        # random_erasing omitted: black boxes corrupt SAM3 mask prediction
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "horizontal_flip", "sam3"],
         "robot_type": "aloha",
         "action_shift": 4,
         "keep_every_n": 3,
@@ -714,6 +717,7 @@ def build_parser():
     parser.add_argument("--sam3-top-masks", type=int, default=4, help="Number of largest SAM2 masks to union as foreground")
     parser.add_argument("--sam3-mask-iou-threshold", type=float, default=0.75, help="Minimum predicted_iou to include a SAM2 mask in the foreground")
     parser.add_argument("--sam3-text-prompt", type=str, default="plastic cup, lid, robot hand", help="Comma-separated text prompt for SAM3 object segmentation")
+    parser.add_argument("--sam3-frame-stride", type=int, default=5, help="Reuse SAM3 mask for N consecutive frames (reduces CPU inference cost)")
 
     return parser
 
