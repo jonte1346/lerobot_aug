@@ -21,7 +21,13 @@
       "Bash(EPISODES=\"0 1 2 3 4 5 6 7 8 9\" SAM3_STRIDE=30 UPLOAD=1 uv run tools/run_production_dataset_v8.py)",
       "Bash(powershell.exe -Command \"Get-Process python* | Select-Object Id,ProcessName,WorkingSet64 | Format-Table -AutoSize\")",
       "Bash(powershell.exe -Command \"Get-WmiObject Win32_Process -Filter 'ProcessId=38268' | Select-Object CommandLine | Format-List\")",
-      "Bash(EPISODES=\"0 1 2 3 4 5 6 7 8 9\" SAM3_STRIDE=30 KEEP_EVERY_N=6 WRITER_THREADS=4 UPLOAD=1 uv run tools/run_production_dataset_v8.py)"
+      "Bash(EPISODES=\"0 1 2 3 4 5 6 7 8 9\" SAM3_STRIDE=30 KEEP_EVERY_N=6 WRITER_THREADS=4 UPLOAD=1 uv run tools/run_production_dataset_v8.py)",
+      "Bash(powershell.exe -Command 'Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '\\\\''*aloha_augment.pipeline*'\\\\'' } | Select-Object ProcessId')",
+      "Bash(xargs -r powershell.exe -Command \"Stop-Process -Id {} -Force\")",
+      "Bash(powershell.exe -Command 'Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '\\\\''*aloha_augment.pipeline*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }')",
+      "Bash(powershell.exe -Command 'Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like '\\\\''*aloha_augment.pipeline*'\\\\'' } | Select-Object -ExpandProperty ProcessId')",
+      "Bash(powershell.exe -Command \"Stop-Process -Id 37916,46716,42668,46256 -Force\")",
+      "Bash(rm -rf __TRACKED_VAR__/.cache/huggingface/lerobot/jgiegold/aloha_balanced_v8)"
     ]
   }
 }

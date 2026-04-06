@@ -255,6 +255,34 @@ TIER_PRESETS = {
         "savgol_polyorder": 2,
         "smooth_exclude_indices": [6, 13],
     },
+    # v9: full episode length + tight mask stride + wide background pool + smoothing
+    "v9": {
+        "include_originals": True,
+        "include_originals_decimated": True,
+        "num_passes": 1,
+        # random_erasing omitted: black boxes corrupt SAM3 mask prediction
+        "augmentations": ["color_jitter", "gaussian_blur", "sharpness", "horizontal_flip", "sam3"],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 1,               # no temporal downsampling → full ~130 frames/ep
+        "frame_stride_cycle": None,
+        "skip_prefilter": False,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.015,
+        "max_action_jerk": 0.0145,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.12,
+        "tail_drop_max": 8,
+        "temporal_jitter_pct": 0.15,
+        "action_noise_std": 0.003,
+        "action_smoothing": "savgol",    # trajectory smoothing
+        "savgol_window_length": 7,
+        "savgol_polyorder": 2,
+        "smooth_exclude_indices": [6, 13],
+        "sam3_frame_stride": 5,          # 0.1s at 50fps — tracks arm motion accurately
+        "sam3_background_history": 200,  # ~4s of frames = real visual diversity
+    },
     # v7 + SAM2 background compositing (requires sam2 package)
     "v7_sam": {
         "include_originals": True,
@@ -290,7 +318,9 @@ def apply_tier_configuration(args, defaults):
 
     preset = TIER_PRESETS[args.tier]
     for key, value in preset.items():
-        setattr(args, key, value)
+        # Only apply preset value if the user didn't explicitly pass this arg
+        if getattr(args, key, None) == defaults.get(key):
+            setattr(args, key, value)
 
     return args
 
