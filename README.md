@@ -10,6 +10,14 @@ A CLI tool that augments [LeRobot v3](https://huggingface.co/docs/lerobot/lerobo
 - Temporal controls: frame decimation, action shift in decimated space, tail drop, temporal jitter
 - Optional action smoothing: Savitzky-Golay filtering with per-dimension exclusions
 
+## Augmented Datasets
+
+v7 - https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_balanced_v7_motor5_nosam_smooth%2Fepisode_0
+
+v8 - https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_balanced_v8%2Fepisode_0
+
+v9 - https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_balanced_v9%2Fepisode_0
+
 ## Setup
 
 ```bash
