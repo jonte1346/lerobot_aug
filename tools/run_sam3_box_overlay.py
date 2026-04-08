@@ -59,7 +59,11 @@ def main() -> int:
     ]
 
     env = os.environ.copy()
-    env.setdefault("PYTHONPATH", str(repo_root / "src"))
+    # Include both repo src and SAM3 in PYTHONPATH for subprocess
+    src_path = str(repo_root / "src")
+    sam3_path = os.getenv("SAM3_PATH", "/kaggle/working/sam3_repo")
+    pythonpath = f"{src_path}:{sam3_path}" if os.path.exists(sam3_path) else src_path
+    env.setdefault("PYTHONPATH", pythonpath)
 
     result = subprocess.run(run_cmd, cwd=repo_root, env=env)
     if result.returncode != 0:
