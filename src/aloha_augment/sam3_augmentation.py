@@ -323,7 +323,8 @@ class SAM3BackgroundCompositor:
         """Text-prompted EfficientSAM3 segmentation. Returns mask or None on failure."""
         from PIL import Image as PILImage
         pil_image = PILImage.fromarray(frame)
-        with torch.no_grad():
+        autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=False) if torch.cuda.is_available() else torch.no_grad()
+        with torch.no_grad(), autocast_ctx:
             state = self._sam3_processor.set_image(pil_image)
             state = self._sam3_processor.set_text_prompt(
                 prompt=self.text_prompt, state=state
