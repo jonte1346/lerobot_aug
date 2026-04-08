@@ -10,10 +10,18 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "transformers>=4.57.6",
+    "lerobot>=0.4.4",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "scipy",
+    "huggingface_hub",
 ]
 
 [project.optional-dependencies]
-pipeline = ["lerobot>=0.4.4", "torch", "torchvision", "tqdm", "scipy"]
+sam3 = [
+    "efficientsam3 @ git+https://github.com/SimonZeng7108/efficientsam3.git",
+]
 dev = ["pytest"]
 
 [project.scripts]
