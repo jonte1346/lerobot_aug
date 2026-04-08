@@ -189,7 +189,7 @@ def get_sam3_model():
             text_encoder_pos_embed_table_size=77,
             interpolate_pos_embed=False,
         ).to(device)
-        processor = EfficientSam3Processor(model, confidence_threshold=0.1)
+        processor = EfficientSam3Processor(model, confidence_threshold=0.01)
         return model, processor
     except ImportError:
         return None, None
@@ -358,13 +358,15 @@ class SAM3BackgroundCompositor:
         cam = self._camera_key
         frame_idx = self._frame_counter.get(cam, 0)
         if frame_idx < 3:  # Log first 3 frames
-            print(f"[SAM3-DEBUG] cam={cam} frame={frame_idx}: masks={masks is not None}, "
-                  f"boxes={boxes is not None}, scores={scores is not None}")
-            if boxes is not None:
+            print(f"[SAM3-DEBUG] cam={cam} frame={frame_idx}: masks_shape={masks.shape if masks is not None else None}, "
+                  f"boxes_len={len(boxes) if boxes is not None else 0}")
+            if boxes is not None and len(boxes) > 0:
                 print(f"  -> {len(boxes)} boxes detected")
-            if scores is not None:
+            if scores is not None and len(scores) > 0:
                 scores_np = scores.cpu().numpy() if isinstance(scores, torch.Tensor) else np.asarray(scores)
-                print(f"  -> confidence scores: min={scores_np.min():.4f}, max={scores_np.max():.4f}, mean={scores_np.mean():.4f}")
+                print(f"  -> confidence scores: min={scores_np.min():.6f}, max={scores_np.max():.6f}, mean={scores_np.mean():.6f}")
+            else:
+                print(f"  -> no scores returned or empty")
 
         # Cache boxes for box_overlay_mode regardless of mask quality
         if boxes is not None:
