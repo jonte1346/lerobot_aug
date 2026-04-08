@@ -152,7 +152,10 @@ def get_sam3_model():
     """
     Load official facebook/sam3 (text-prompted, video-capable) from facebookresearch/sam3.
 
-    Returns (model, Sam3Processor) or (None, None).
+    Requires: facebook/sam3 to be installed via:
+      pip install git+https://github.com/facebookresearch/sam3.git
+
+    Or manually cloned and added to Python path. Returns (model, Sam3Processor) or (None, None).
     """
     try:
         from sam3.model_builder import build_sam3_image_model
@@ -162,7 +165,11 @@ def get_sam3_model():
         model = build_sam3_image_model().to(device)
         processor = Sam3Processor(model, confidence_threshold=0.01)
         return model, processor
-    except ImportError:
+    except ImportError as e:
+        print(f"[SAM3] ImportError: {e}")
+        print(f"[SAM3] Hint: facebook/sam3 not installed. Try one of:")
+        print(f"       1. pip install git+https://github.com/facebookresearch/sam3.git")
+        print(f"       2. git clone + pip install -e /path/to/sam3")
         return None, None
     except Exception as e:
         print(f"Warning: Could not load facebook/sam3: {e}")

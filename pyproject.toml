@@ -9,19 +9,17 @@ description = "LeRobot v3 dataset augmentation tool"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "transformers>=4.57.6",
+    "transformers>=4.57.6,<5",
     "lerobot>=0.4.4",
-    "torch",
-    "torchvision",
+    "torch>=2.2.1,<2.11.0",
+    "torchvision>=0.21.0,<0.26.0",
     "tqdm",
     "scipy",
-    "huggingface_hub",
+    "huggingface_hub>=0.34.2,<0.36.0",
 ]
 
 [project.optional-dependencies]
-sam3 = [
-    "sam3 @ git+https://github.com/facebookresearch/sam3.git",
-]
+sam3 = []
 dev = ["pytest"]
 
 [project.scripts]
