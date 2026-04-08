@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 _EPISODES     = os.getenv("EPISODES", "0").split()
-_TEXT_PROMPT  = os.getenv("SAM3_TEXT_PROMPT", "plastic cup, lid")
+_TEXT_PROMPT  = os.getenv("SAM3_TEXT_PROMPT", "plastic cup, lid, robot hand")
 _OUTPUT_REPO  = os.getenv("OUTPUT_REPO", "jgiegold/aloha_sam3_boxes")
 _UPLOAD       = os.getenv("UPLOAD", "0") == "1"
 
