@@ -109,6 +109,7 @@ def build_sam3(args):
         mask_iou_threshold=getattr(args, "sam3_mask_iou_threshold", 0.75),
         text_prompt=getattr(args, "sam3_text_prompt", "plastic cup, lid, robot hand"),
         sam3_frame_stride=getattr(args, "sam3_frame_stride", 5),
+        box_overlay_mode=getattr(args, "sam3_box_overlay", False),
     )
     return SAM3MaskCapture(compositor)
 
@@ -284,6 +285,32 @@ TIER_PRESETS = {
         "smooth_exclude_indices": [6, 13],
         "sam3_frame_stride": 5,          # 0.1s at 50fps — tracks arm motion accurately
         "sam3_background_history": 200,  # ~4s of frames = real visual diversity
+    },
+    # v9 with SAM3 bounding boxes drawn on camera frames (for visual inspection)
+    "v9_boxes": {
+        "include_originals": True,
+        "include_originals_decimated": False,
+        "num_passes": 1,
+        "augmentations": ["sam3"],
+        "robot_type": "aloha",
+        "action_shift": 4,
+        "keep_every_n": 1,
+        "frame_stride_cycle": None,
+        "skip_prefilter": False,
+        "prefilter_mode": "fast",
+        "prefilter_sample_every_n": 8,
+        "min_action_delta": 0.015,
+        "max_action_jerk": 0.0145,
+        "sparc_threshold": -10.0,
+        "saturation_threshold": 0.12,
+        "tail_drop_max": 8,
+        "temporal_jitter_pct": 0.0,
+        "action_noise_std": 0.0,
+        "action_smoothing": "none",
+        "sam3_frame_stride": 1,           # run SAM3 every frame for accurate boxes
+        "sam3_background_history": 1,
+        "sam3_box_overlay": True,         # draw boxes instead of compositing
+        "sam3_text_prompt": "plastic cup, lid",
     },
     # v7 + SAM2 background compositing (requires sam2 package)
     "v7_sam": {
@@ -807,6 +834,7 @@ def build_parser():
     parser.add_argument("--sam3-mask-iou-threshold", type=float, default=0.75, help="Minimum predicted_iou to include a SAM2 mask in the foreground")
     parser.add_argument("--sam3-text-prompt", type=str, default="plastic cup, lid, robot hand", help="Comma-separated text prompt for SAM3 object segmentation")
     parser.add_argument("--sam3-frame-stride", type=int, default=5, help="Reuse SAM3 mask for N consecutive frames (reduces CPU inference cost)")
+    parser.add_argument("--sam3-box-overlay", action="store_true", default=False, help="Draw SAM3 bounding boxes on camera frames instead of compositing backgrounds")
 
     return parser
 

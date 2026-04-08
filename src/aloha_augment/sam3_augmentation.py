@@ -173,7 +173,7 @@ def get_sam3_model():
             text_encoder_pos_embed_table_size=77,
             interpolate_pos_embed=False,
         ).to(device)
-        processor = EfficientSam3Processor(model)
+        processor = EfficientSam3Processor(model, confidence_threshold=0.1)
         return model, processor
     except ImportError:
         return None, None
@@ -253,6 +253,7 @@ class SAM3BackgroundCompositor:
         mask_iou_threshold: float = 0.75,
         text_prompt: str = "plastic cup, lid, robot hand",
         sam3_frame_stride: int = 5,
+        box_overlay_mode: bool = False,
     ):
         self.feather_radius = feather_radius
         self.brightness_threshold = brightness_threshold
@@ -261,6 +262,7 @@ class SAM3BackgroundCompositor:
         self.mask_iou_threshold = float(mask_iou_threshold)
         self.text_prompt = text_prompt
         self.sam3_frame_stride = max(1, int(sam3_frame_stride))
+        self.box_overlay_mode = box_overlay_mode
         self._warned_predictor = False
         self._camera_key = "default"
         self._history: dict[str, deque[np.ndarray]] = {}
@@ -270,6 +272,8 @@ class SAM3BackgroundCompositor:
         # Last computed masks (raw and feathered) per camera
         self._last_raw_mask: dict[str, np.ndarray] = {}      # key → H×W uint8 binary mask
         self._last_feathered_mask: dict[str, np.ndarray] = {}  # key → H×W float32 feathered [0, 1]
+        # Last detected boxes per camera (box_overlay_mode)
+        self._last_boxes: dict[str, tuple] = {}  # key → (boxes_tensor, scores_tensor)
         # Episode statistics
         self._episode_stats: dict[str, int | float] = {
             "frame_count": 0,
@@ -331,11 +335,33 @@ class SAM3BackgroundCompositor:
                 prompt=self.text_prompt, state=state
             )
         masks = state.get("masks")
+        boxes = state.get("boxes")
+        scores = state.get("scores")
+        # Cache boxes for box_overlay_mode regardless of mask quality
+        if boxes is not None:
+            cam = self._camera_key
+            self._last_boxes[cam] = (boxes.cpu(), scores.cpu() if scores is not None else None)
         if masks is not None and len(masks) > 0:
             if isinstance(masks, torch.Tensor):
-                return masks.any(dim=0).cpu().numpy().astype(np.uint8)
+                return masks.any(dim=0).squeeze(0).cpu().numpy().astype(np.uint8)
             return np.logical_or.reduce(np.asarray(masks)).astype(np.uint8)
         return None
+
+    def _draw_boxes_on_frame(self, frame_np: np.ndarray) -> np.ndarray:
+        """Draw SAM3 bounding boxes on frame. Returns annotated copy."""
+        from PIL import Image as PILImage, ImageDraw
+        cam = self._camera_key
+        boxes, scores = self._last_boxes.get(cam, (None, None))
+        if boxes is None or len(boxes) == 0:
+            return frame_np
+        img = PILImage.fromarray(frame_np)
+        draw = ImageDraw.Draw(img)
+        for i in range(len(boxes)):
+            x0, y0, x1, y1 = boxes[i].tolist()
+            score = scores[i].item() if scores is not None else 0.0
+            draw.rectangle([x0, y0, x1, y1], outline=(0, 255, 0), width=3)
+            draw.text((x0 + 2, max(0, y0 - 14)), f"{score:.2f}", fill=(0, 255, 0))
+        return np.array(img)
 
     def _predict_mask_sam2(self, frame: np.ndarray) -> Optional[np.ndarray]:
         """SAM2 automatic mask generator. Returns mask or None on failure."""
@@ -400,23 +426,29 @@ class SAM3BackgroundCompositor:
         frame_np = _to_numpy_uint8_hwc(frame)
         self._episode_stats["frame_count"] += 1
 
+        raw_mask = self._predict_mask(frame_np)
+
+        if self.box_overlay_mode:
+            # Draw SAM3 bounding boxes on the original frame; skip background compositing.
+            annotated = self._draw_boxes_on_frame(frame_np)
+            return _from_numpy_like(annotated, frame)
+
         cam_history = self._history.setdefault(self._camera_key, deque(maxlen=self.background_history))
         if cam_history:
             bg = cam_history[np.random.randint(0, len(cam_history))]
         else:
             bg = frame_np
 
-        raw_mask = self._predict_mask(frame_np)
         fg_rgba, feathered_alpha = extract_foreground_with_feathering(frame_np, raw_mask, feather_radius=self.feather_radius)
-        
+
         # Store masks for later retrieval
         self._last_raw_mask[self._camera_key] = raw_mask
         self._last_feathered_mask[self._camera_key] = feathered_alpha
-        
+
         # Track mask coverage
         coverage = raw_mask.astype(np.float32).mean()
         self._episode_stats["mask_coverage_total"] += coverage
-        
+
         composited = composite_backgrounds(fg_rgba, feathered_alpha, [bg])[0]
         cam_history.append(frame_np)
 
