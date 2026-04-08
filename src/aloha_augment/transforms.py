@@ -228,3 +228,41 @@ class HorizontalFlipWithActionMirror:
             f"state_mask={self.state_mirror_mask.tolist()}, "
             f"swap_action_ranges={self.swap_action_ranges}, swap_state_ranges={self.swap_state_ranges})"
         )
+
+class SAM3MaskCapture:
+    """Wrapper around SAM3BackgroundCompositor to expose masks."""
+
+    def __init__(self, compositor):
+        self.compositor = compositor
+        # Only store the last mask per camera — no accumulation to avoid ~780MB memory pressure.
+        self._last_masks: dict[str, tuple] = {}
+
+    def reset_episode(self):
+        self.compositor.reset_episode()
+        self._last_masks = {}
+
+    def seed_background_history(self, frames_by_camera: dict):
+        self.compositor.seed_background_history(frames_by_camera)
+
+    def set_camera_key(self, camera_key: str):
+        self.compositor.set_camera_key(camera_key)
+
+    def __call__(self, frame):
+        composited = self.compositor(frame)
+        cam_key = self.compositor._camera_key
+        raw_mask = self.compositor.get_last_raw_mask(cam_key)
+        feathered_mask = self.compositor.get_last_feathered_mask(cam_key)
+        if raw_mask is not None and feathered_mask is not None:
+            self._last_masks[cam_key] = (raw_mask, feathered_mask)
+        return composited
+
+    def get_episode_masks(self, camera_key: str):
+        """Return a one-element list with the last mask, matching the expected [-1] access pattern."""
+        last = self._last_masks.get(camera_key)
+        return [last] if last is not None else []
+    
+    def log_episode_stats(self, episode_idx: int, camera_keys: list[str]):
+        self.compositor.log_episode_stats(episode_idx, camera_keys)
+    
+    def __repr__(self):
+        return f"SAM3MaskCapture({self.compositor})"

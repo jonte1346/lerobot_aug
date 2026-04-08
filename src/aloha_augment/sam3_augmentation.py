@@ -267,6 +267,17 @@ class SAM3BackgroundCompositor:
         # Per-camera mask cache for frame-stride reuse
         self._mask_cache: dict[str, tuple[int, np.ndarray]] = {}  # key → (frame_idx, mask)
         self._frame_counter: dict[str, int] = {}
+        # Last computed masks (raw and feathered) per camera
+        self._last_raw_mask: dict[str, np.ndarray] = {}      # key → H×W uint8 binary mask
+        self._last_feathered_mask: dict[str, np.ndarray] = {}  # key → H×W float32 feathered [0, 1]
+        # Episode statistics
+        self._episode_stats: dict[str, int | float] = {
+            "frame_count": 0,
+            "sam3_calls": 0,
+            "cache_hits": 0,
+            "mask_coverage_total": 0.0,
+            "fallback_count": 0,
+        }
 
         # Try SAM3 first; only load SAM2 if SAM3 is unavailable.
         self._sam3_model, self._sam3_processor = get_sam3_model()
@@ -283,6 +294,29 @@ class SAM3BackgroundCompositor:
         self._history = {}
         self._mask_cache = {}
         self._frame_counter = {}
+        self._last_raw_mask = {}
+        self._last_feathered_mask = {}
+        self._episode_stats = {
+            "frame_count": 0,
+            "sam3_calls": 0,
+            "cache_hits": 0,
+            "mask_coverage_total": 0.0,
+            "fallback_count": 0,
+        }
+
+    def seed_background_history(self, frames_by_camera: dict):
+        """Pre-populate background history with frames from a previous episode.
+
+        Call this after reset_episode() to ensure the history pool starts with
+        visually diverse frames from a different scene rather than being empty.
+
+        Args:
+            frames_by_camera: dict mapping camera_key → list[np.ndarray (H,W,3 uint8)]
+        """
+        for cam_key, frames in frames_by_camera.items():
+            pool = self._history.setdefault(cam_key, deque(maxlen=self.background_history))
+            for f in frames:
+                pool.append(f)
 
     def set_camera_key(self, camera_key: str):
         self._camera_key = camera_key
@@ -323,18 +357,28 @@ class SAM3BackgroundCompositor:
             self._frame_counter[cam] = idx + 1
             cached_idx, cached_mask = self._mask_cache.get(cam, (-999, None))
             if cached_mask is not None and (idx - cached_idx) < self.sam3_frame_stride:
+                self._episode_stats["cache_hits"] += 1
                 return cached_mask
             try:
                 mask = self._predict_mask_sam3(frame)
                 if mask is not None:
                     coverage = mask.mean()
                     bad = coverage < 0.01 or coverage > 0.80
-                    if bad and cached_mask is not None:
-                        # Bad mask (occlusion / over-segmentation) — reuse last good mask
-                        return cached_mask
-                    # Good mask, or no cache to fall back to
-                    self._mask_cache[cam] = (idx, mask)
-                    return mask
+                    if bad:
+                        if cached_mask is not None:
+                            # Bad mask — reuse last good cached mask
+                            print(f"[SAM3] cam={cam} frame={idx}: bad coverage {coverage:.2%}, reusing cached mask")
+                            self._episode_stats["fallback_count"] += 1
+                            return cached_mask
+                        else:
+                            # No cache to fall back to — don't store a bad mask, drop to heuristic
+                            print(f"[SAM3] cam={cam} frame={idx}: bad coverage {coverage:.2%}, no cache — falling back to heuristic")
+                    else:
+                        self._mask_cache[cam] = (idx, mask)
+                        self._episode_stats["sam3_calls"] += 1
+                        return mask
+                else:
+                    print(f"[SAM3] cam={cam} frame={idx}: no mask returned, falling back to heuristic")
             except Exception as exc:
                 if not self._warned_predictor:
                     print(f"Warning: SAM3 failed, falling back to heuristic: {exc}")
@@ -349,10 +393,12 @@ class SAM3BackgroundCompositor:
                     print(f"Warning: SAM2 failed, falling back to heuristic: {exc}")
                     self._warned_predictor = True
 
+        self._episode_stats["fallback_count"] += 1
         return simple_robot_mask_heuristic(frame, brightness_threshold=self.brightness_threshold)
 
     def __call__(self, frame):
         frame_np = _to_numpy_uint8_hwc(frame)
+        self._episode_stats["frame_count"] += 1
 
         cam_history = self._history.setdefault(self._camera_key, deque(maxlen=self.background_history))
         if cam_history:
@@ -360,10 +406,45 @@ class SAM3BackgroundCompositor:
         else:
             bg = frame_np
 
-        mask = self._predict_mask(frame_np)
-        fg_rgba, alpha = extract_foreground_with_feathering(frame_np, mask, feather_radius=self.feather_radius)
-        composited = composite_backgrounds(fg_rgba, alpha, [bg])[0]
-
+        raw_mask = self._predict_mask(frame_np)
+        fg_rgba, feathered_alpha = extract_foreground_with_feathering(frame_np, raw_mask, feather_radius=self.feather_radius)
+        
+        # Store masks for later retrieval
+        self._last_raw_mask[self._camera_key] = raw_mask
+        self._last_feathered_mask[self._camera_key] = feathered_alpha
+        
+        # Track mask coverage
+        coverage = raw_mask.astype(np.float32).mean()
+        self._episode_stats["mask_coverage_total"] += coverage
+        
+        composited = composite_backgrounds(fg_rgba, feathered_alpha, [bg])[0]
         cam_history.append(frame_np)
 
         return _from_numpy_like(composited, frame)
+
+    def get_last_raw_mask(self, camera_key: Optional[str] = None) -> Optional[np.ndarray]:
+        """Get the most recently computed raw (binary) mask for a camera."""
+        key = camera_key if camera_key is not None else self._camera_key
+        return self._last_raw_mask.get(key)
+
+    def get_last_feathered_mask(self, camera_key: Optional[str] = None) -> Optional[np.ndarray]:
+        """Get the most recently computed feathered (alpha) mask for a camera."""
+        key = camera_key if camera_key is not None else self._camera_key
+        return self._last_feathered_mask.get(key)
+
+    def log_episode_stats(self, episode_idx: int, camera_keys: list[str]):
+        """Log episode statistics at end of episode."""
+        if self._episode_stats["frame_count"] == 0:
+            return
+        
+        avg_coverage = self._episode_stats["mask_coverage_total"] / self._episode_stats["frame_count"]
+        model_info = "SAM3" if self._sam3_model is not None else ("SAM2" if self.predictor is not None else "heuristic")
+        
+        print(
+            f"  Episode {episode_idx} | {model_info} | "
+            f"frames={self._episode_stats['frame_count']} | "
+            f"sam3_calls={self._episode_stats['sam3_calls']} | "
+            f"cache_hits={self._episode_stats['cache_hits']} | "
+            f"avg_coverage={avg_coverage:.1%} | "
+            f"fallbacks={self._episode_stats['fallback_count']}"
+        )

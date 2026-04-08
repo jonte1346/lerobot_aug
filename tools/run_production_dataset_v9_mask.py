@@ -29,14 +29,14 @@ _UPLOAD         = os.getenv("UPLOAD", "0") == "1"
 
 
 def main() -> int:
-    """v9 build: full episode length, tight mask stride, wide background pool."""
+    """v9_mask build: full episode length, tight mask stride, wide background pool, with SAM3 masks."""
     repo_root = Path(__file__).resolve().parents[1]
 
     frames_per_ep      = 130 // max(1, _KEEP_EVERY_N)
     sam3_calls_per_ep  = frames_per_ep * 4 / _SAM3_STRIDE   # 4 cameras
     est_min            = len(_EPISODES) * sam3_calls_per_ep * 12 / 60
     print(
-        f"v9 build | episodes={_EPISODES} | sam3-stride={_SAM3_STRIDE} | "
+        f"v9_mask build | episodes={_EPISODES} | sam3-stride={_SAM3_STRIDE} | "
         f"keep-every-n={_KEEP_EVERY_N} | bg-history={_BG_HISTORY} | "
         f"threads={_WRITER_THREADS} | "
         f"estimated ~{est_min:.0f} min on CPU | upload={'yes' if _UPLOAD else 'no'}",
@@ -77,7 +77,7 @@ def main() -> int:
             folder_path=str(local_dir),
             repo_id=_OUTPUT_REPO,
             repo_type="dataset",
-            commit_message="Upload v9 production dataset (full frames, tight SAM3 stride)",
+            commit_message="Upload v9_mask production dataset (full frames, tight SAM3 stride, with segmentation masks)",
         )
         print(
             f"Done: https://huggingface.co/spaces/lerobot/visualize_dataset"

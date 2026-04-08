@@ -99,8 +99,9 @@ def build_horizontal_flip(args):
 
 def build_sam3(args):
     from .sam3_augmentation import SAM3BackgroundCompositor
+    from .transforms import SAM3MaskCapture
 
-    return SAM3BackgroundCompositor(
+    compositor = SAM3BackgroundCompositor(
         feather_radius=args.sam3_feather_radius,
         brightness_threshold=args.sam3_brightness_threshold,
         background_history=args.sam3_background_history,
@@ -109,6 +110,7 @@ def build_sam3(args):
         text_prompt=getattr(args, "sam3_text_prompt", "plastic cup, lid, robot hand"),
         sam3_frame_stride=getattr(args, "sam3_frame_stride", 5),
     )
+    return SAM3MaskCapture(compositor)
 
 
 AUGMENTATION_BUILDERS = {
@@ -387,6 +389,11 @@ def build_frame_dict(item, feature_keys, features_meta, action_override=None):
             if getattr(val, "ndim", None) == 0 and expected_shape == (1,):
                 val = val.reshape(1)
         frame[key] = val
+
+    # Always include any segmentation masks already attached to the frame.
+    for key, val in item.items():
+        if key.startswith("segmentation.mask.") and key not in frame:
+            frame[key] = val
     return frame
 
 
@@ -509,6 +516,28 @@ def resolve_smoothing_exclude_indices(args):
     return []
 
 
+def sample_episode_frames(source, ep_idx: int, camera_keys: list, n: int = 50) -> dict:
+    """Load N evenly-spaced frames from a source episode as background seed material.
+
+    Returns a dict: camera_key → list[np.ndarray (H,W,3 uint8)]
+    """
+    from .sam3_augmentation import _to_numpy_uint8_hwc
+
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+    total = to_idx - from_idx
+    if total <= 0:
+        return {}
+    step = max(1, total // n)
+    indices = list(range(from_idx, to_idx, step))[:n]
+    frames_by_cam: dict = {k: [] for k in camera_keys}
+    for idx in indices:
+        item = source[idx]
+        for cam_key in camera_keys:
+            if cam_key in item:
+                frames_by_cam[cam_key].append(_to_numpy_uint8_hwc(item[cam_key]))
+    return {k: v for k, v in frames_by_cam.items() if v}
+
+
 def write_episode(
     source,
     output,
@@ -527,6 +556,7 @@ def write_episode(
     savgol_window_length=7,
     savgol_polyorder=2,
     smooth_exclude_indices=None,
+    seed_frames=None,
 ):
     from_idx, to_idx = get_episode_range(source, ep_idx)
     tail_drop = int(np.random.randint(0, tail_drop_max + 1)) if tail_drop_max > 0 else 0
@@ -584,6 +614,8 @@ def write_episode(
 
     if transform is not None:
         reset_transform_state(transform)
+        if seed_frames is not None and hasattr(transform, "seed_background_history"):
+            transform.seed_background_history(seed_frames)
 
     if isinstance(transform, (StaticErasing, DriftingBlob)):
         first = source[from_idx]
@@ -616,6 +648,13 @@ def write_episode(
                 if transform is not None:
                     set_transform_camera(transform, cam_key)
                     item[cam_key] = transform(item[cam_key])
+                    if hasattr(transform, "get_episode_masks"):
+                        masks = transform.get_episode_masks(cam_key)
+                        if masks:
+                            raw_mask, _ = masks[-1]
+                            # Convert binary (H,W) mask → (H,W,3) grayscale RGB video frame
+                            mask_rgb = np.stack([raw_mask * 255] * 3, axis=-1).astype(np.uint8)
+                            item[f"segmentation.mask.{cam_key.split('.')[-1]}"] = mask_rgb
 
         if flip is not None:
             if action_override is not None:
@@ -625,9 +664,29 @@ def write_episode(
             if "observation.state" in item:
                 item["observation.state"] = flip.mirror_state(item["observation.state"])
 
+        # Ensure segmentation masks exist for all cameras when mask features are declared.
+        # Originals (no transform) would otherwise fail feature validation.
+        for cam_key in camera_keys:
+            mask_key = f"segmentation.mask.{cam_key.split('.')[-1]}"
+            if mask_key in feature_keys and mask_key not in item:
+                cam_img = item.get(cam_key)
+                if cam_img is not None and hasattr(cam_img, "shape"):
+                    shape = tuple(cam_img.shape)
+                    if len(shape) == 3 and shape[0] in (1, 3, 4):
+                        h, w = int(shape[1]), int(shape[2])
+                    elif len(shape) >= 2:
+                        h, w = int(shape[0]), int(shape[1])
+                    else:
+                        h, w = 480, 640
+                else:
+                    h, w = 480, 640
+                item[mask_key] = np.zeros((h, w, 3), dtype=np.uint8)
+
         output.add_frame(build_frame_dict(item, feature_keys, features_meta, action_override=action_override))
 
     output.save_episode()
+    if transform is not None and hasattr(transform, "log_episode_stats"):
+        transform.log_episode_stats(ep_idx, camera_keys)
 
 
 def build_parser():
@@ -756,9 +815,7 @@ def parse_args():
     parser = build_parser()
     args = parser.parse_args()
     defaults = _parser_defaults(parser)
-    if args.augmentations is None:
-        args.augmentations = ["color_jitter"]
-    if args.skip_sam3:
+    if args.skip_sam3 and args.augmentations is not None:
         args.augmentations = [a for a in args.augmentations if a != "sam3"]
     if args.temporal_jitter_pct < 0 or args.temporal_jitter_pct > 1:
         raise SystemExit("Error: --temporal-jitter-pct must be in [0, 1].")
@@ -772,6 +829,8 @@ def parse_args():
 def main():
     args, defaults = parse_args()
     apply_tier_configuration(args, defaults)
+    if args.augmentations is None:
+        args.augmentations = ["color_jitter"]
     t0 = time.time()
 
     if args.seed is not None:
@@ -851,6 +910,27 @@ def main():
 
     features_meta = source.meta.features
     user_features = {k: v for k, v in features_meta.items() if k not in set(DEFAULT_FEATURES.keys())}
+    
+    # Add mask features if SAM3 augmentation is enabled
+    if "sam3" in args.augmentations:
+        for cam_key in camera_keys:
+            cam_data = source[0][cam_key] if cam_key in source[0] else None
+            if cam_data is not None and hasattr(cam_data, "shape"):
+                shape = tuple(cam_data.shape)
+                if len(shape) == 3 and shape[0] in (1, 3, 4):
+                    h, w = int(shape[1]), int(shape[2])
+                elif len(shape) >= 2:
+                    h, w = int(shape[0]), int(shape[1])
+                else:
+                    h, w = 480, 640
+            else:
+                h, w = 480, 640
+            mask_key = f"segmentation.mask.{cam_key.split('.')[-1]}"
+            # Store as video so the lerobot visualizer renders it as a playable image stream.
+            user_features[mask_key] = {"dtype": "video", "shape": (h, w, 3), "names": ["height", "width", "channel"]}
+
+    # Ensure frame writer can emit newly added features (e.g., segmentation masks).
+    feature_keys = list(dict.fromkeys(feature_keys + list(user_features.keys())))
 
     print(f"\nCreating output dataset: {args.output}")
     output = LeRobotDataset.create(
@@ -927,7 +1007,11 @@ def main():
                 f"effective={effective_shift} selected-frame steps"
             )
 
+            prev_ep_idx = None
             for ep_idx in tqdm(episode_indices, desc=f"Pass {pass_idx + 1}/{args.num_passes}"):
+                seed_frames = None
+                if transform is not None and hasattr(transform, "seed_background_history") and prev_ep_idx is not None:
+                    seed_frames = sample_episode_frames(source, prev_ep_idx, camera_keys, n=50)
                 write_episode(
                     source,
                     output,
@@ -946,7 +1030,9 @@ def main():
                     savgol_window_length=args.savgol_window_length,
                     savgol_polyorder=args.savgol_polyorder,
                     smooth_exclude_indices=resolve_smoothing_exclude_indices(args),
+                    seed_frames=seed_frames,
                 )
+                prev_ep_idx = ep_idx
 
         print("\nFinalizing dataset...")
         output.finalize()
