@@ -178,12 +178,12 @@ def get_sam3_model():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         checkpoint_path = hf_hub_download(
             repo_id="Simon7108528/EfficientSAM3",
-            filename="stage1_all_converted/efficient_sam3_tinyvit_11m_mobileclip_s1.pth",
+            filename="stage1_all_converted/efficient_sam3_repvit_l_mobileclip_s1.pth",
         )
         model = build_efficientsam3_image_model(
             checkpoint_path=checkpoint_path,
-            backbone_type="tinyvit",
-            model_name="11m",
+            backbone_type="repvit",
+            model_name="l",
             text_encoder_type="MobileCLIP-S1",
             text_encoder_context_length=77,
             text_encoder_pos_embed_table_size=77,
