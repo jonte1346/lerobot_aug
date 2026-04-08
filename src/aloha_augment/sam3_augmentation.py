@@ -166,13 +166,14 @@ def get_sam3_model():
         vocab_file = sam3_assets_dir / "bpe_simple_vocab_16e6.txt.gz"
         if not vocab_file.exists():
             sam3_assets_dir.mkdir(parents=True, exist_ok=True)
-            vocab_path = hf_hub_download(
-                repo_id="Simon7108528/EfficientSAM3",
-                filename="bpe_simple_vocab_16e6.txt.gz",
-                local_dir=str(sam3_assets_dir),
-                local_dir_use_symlinks=False,
-            )
-            print(f"[SAM3] Downloaded vocabulary file: {vocab_path}")
+            import urllib.request
+            # Vocab file is in GitHub repo, not HF hub
+            vocab_url = "https://raw.githubusercontent.com/SimonZeng7108/efficientsam3/main/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+            try:
+                urllib.request.urlretrieve(vocab_url, vocab_file)
+                print(f"[SAM3] Downloaded vocabulary file from GitHub: {vocab_file}")
+            except Exception as e:
+                print(f"[SAM3] Warning: Could not download vocabulary file: {e}")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         checkpoint_path = hf_hub_download(
