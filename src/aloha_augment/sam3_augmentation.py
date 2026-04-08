@@ -158,6 +158,21 @@ def get_sam3_model():
         from sam3.model_builder import build_efficientsam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor as EfficientSam3Processor
         from huggingface_hub import hf_hub_download
+        import sam3
+        from pathlib import Path
+
+        # Ensure required asset files are present (vocabulary for text encoder)
+        sam3_assets_dir = Path(sam3.__file__).parent / "assets"
+        vocab_file = sam3_assets_dir / "bpe_simple_vocab_16e6.txt.gz"
+        if not vocab_file.exists():
+            sam3_assets_dir.mkdir(parents=True, exist_ok=True)
+            vocab_path = hf_hub_download(
+                repo_id="Simon7108528/EfficientSAM3",
+                filename="bpe_simple_vocab_16e6.txt.gz",
+                local_dir=str(sam3_assets_dir),
+                local_dir_use_symlinks=False,
+            )
+            print(f"[SAM3] Downloaded vocabulary file: {vocab_path}")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         checkpoint_path = hf_hub_download(
