@@ -41,6 +41,7 @@ def main() -> int:
         f"SAM3 box overlay | episodes={episodes_str} | "
         f"prompt='{_TEXT_PROMPT}' | output={args.output} | upload={args.upload}"
     )
+    print(f"Working from: {repo_root}")
 
     run_cmd = [
         sys.executable,
@@ -63,7 +64,8 @@ def main() -> int:
     src_path = str(repo_root / "src")
     sam3_path = os.getenv("SAM3_PATH", "/kaggle/working/sam3_repo")
     pythonpath = f"{src_path}:{sam3_path}" if os.path.exists(sam3_path) else src_path
-    env.setdefault("PYTHONPATH", pythonpath)
+    env["PYTHONPATH"] = pythonpath  # Override any existing PYTHONPATH
+    print(f"PYTHONPATH: {pythonpath}")
 
     result = subprocess.run(run_cmd, cwd=repo_root, env=env)
     if result.returncode != 0:
