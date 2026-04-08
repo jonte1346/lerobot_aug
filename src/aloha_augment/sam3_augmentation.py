@@ -353,9 +353,21 @@ class SAM3BackgroundCompositor:
         masks = state.get("masks")
         boxes = state.get("boxes")
         scores = state.get("scores")
+
+        # Debug logging on first few frames per camera
+        cam = self._camera_key
+        frame_idx = self._frame_counter.get(cam, 0)
+        if frame_idx < 3:  # Log first 3 frames
+            print(f"[SAM3-DEBUG] cam={cam} frame={frame_idx}: masks={masks is not None}, "
+                  f"boxes={boxes is not None}, scores={scores is not None}")
+            if boxes is not None:
+                print(f"  -> {len(boxes)} boxes detected")
+            if scores is not None:
+                scores_np = scores.cpu().numpy() if isinstance(scores, torch.Tensor) else np.asarray(scores)
+                print(f"  -> confidence scores: min={scores_np.min():.4f}, max={scores_np.max():.4f}, mean={scores_np.mean():.4f}")
+
         # Cache boxes for box_overlay_mode regardless of mask quality
         if boxes is not None:
-            cam = self._camera_key
             self._last_boxes[cam] = (boxes.cpu(), scores.cpu() if scores is not None else None)
         if masks is not None and len(masks) > 0:
             if isinstance(masks, torch.Tensor):
