@@ -150,51 +150,22 @@ def augment_episode_with_sam3(
 
 def get_sam3_model():
     """
-    Load EfficientSAM3 (text-prompted, CPU-friendly) from Simon7108528/EfficientSAM3.
+    Load official facebook/sam3 (text-prompted, video-capable) from facebookresearch/sam3.
 
     Returns (model, Sam3Processor) or (None, None).
     """
     try:
-        from sam3.model_builder import build_efficientsam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor as EfficientSam3Processor
-        from huggingface_hub import hf_hub_download
-        import sam3
-        from pathlib import Path
-
-        # Ensure required asset files are present (vocabulary for text encoder)
-        sam3_assets_dir = Path(sam3.__file__).parent / "assets"
-        vocab_file = sam3_assets_dir / "bpe_simple_vocab_16e6.txt.gz"
-        if not vocab_file.exists():
-            sam3_assets_dir.mkdir(parents=True, exist_ok=True)
-            import urllib.request
-            # Vocab file is in GitHub repo, not HF hub
-            vocab_url = "https://raw.githubusercontent.com/SimonZeng7108/efficientsam3/main/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
-            try:
-                urllib.request.urlretrieve(vocab_url, vocab_file)
-                print(f"[SAM3] Downloaded vocabulary file from GitHub: {vocab_file}")
-            except Exception as e:
-                print(f"[SAM3] Warning: Could not download vocabulary file: {e}")
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        checkpoint_path = hf_hub_download(
-            repo_id="Simon7108528/EfficientSAM3",
-            filename="stage1_all_converted/efficient_sam3_repvit_l_mobileclip_s1.pth",
-        )
-        model = build_efficientsam3_image_model(
-            checkpoint_path=checkpoint_path,
-            backbone_type="repvit",
-            model_name="l",
-            text_encoder_type="MobileCLIP-S1",
-            text_encoder_context_length=77,
-            text_encoder_pos_embed_table_size=77,
-            interpolate_pos_embed=False,
-        ).to(device)
-        processor = EfficientSam3Processor(model, confidence_threshold=0.01)
+        model = build_sam3_image_model().to(device)
+        processor = Sam3Processor(model, confidence_threshold=0.01)
         return model, processor
     except ImportError:
         return None, None
     except Exception as e:
-        print(f"Warning: Could not load EfficientSAM3: {e}")
+        print(f"Warning: Could not load facebook/sam3: {e}")
         return None, None
 
 
@@ -304,7 +275,7 @@ class SAM3BackgroundCompositor:
         self.predictor = None if self._sam3_model is not None else get_sam3_predictor()
 
         if self._sam3_model is not None:
-            print(f"SAM3BackgroundCompositor: using EfficientSAM3 (text-prompted, stride={self.sam3_frame_stride})")
+            print(f"SAM3BackgroundCompositor: using facebook/sam3 (text-prompted, stride={self.sam3_frame_stride})")
         elif self.predictor is not None:
             print("SAM3BackgroundCompositor: using SAM2 automatic mask generator")
         else:
