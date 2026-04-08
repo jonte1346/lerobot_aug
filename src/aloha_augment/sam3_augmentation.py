@@ -162,7 +162,7 @@ def get_sam3_model():
         from sam3.model.sam3_image_processor import Sam3Processor
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = build_sam3_image_model().to(device)
+        model = build_sam3_image_model().to(device).float()
         processor = Sam3Processor(model, confidence_threshold=0.01)
         return model, processor
     except ImportError as e:
