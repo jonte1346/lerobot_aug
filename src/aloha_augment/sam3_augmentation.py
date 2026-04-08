@@ -163,6 +163,13 @@ def get_sam3_model():
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = build_sam3_image_model().to(device).float()
+
+        def _force_float32(module, inputs):
+            return tuple(x.float() if isinstance(x, torch.Tensor) else x for x in inputs)
+
+        for mod in model.modules():
+            mod.register_forward_pre_hook(_force_float32)
+
         processor = Sam3Processor(model, confidence_threshold=0.01)
         return model, processor
     except ImportError as e:
@@ -323,8 +330,7 @@ class SAM3BackgroundCompositor:
         """Text-prompted EfficientSAM3 segmentation. Returns mask or None on failure."""
         from PIL import Image as PILImage
         pil_image = PILImage.fromarray(frame)
-        autocast_ctx = torch.amp.autocast(device_type="cuda", enabled=False) if torch.cuda.is_available() else torch.no_grad()
-        with torch.no_grad(), autocast_ctx:
+        with torch.no_grad():
             state = self._sam3_processor.set_image(pil_image)
             state = self._sam3_processor.set_text_prompt(
                 prompt=self.text_prompt, state=state
