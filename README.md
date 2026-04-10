@@ -1,6 +1,6 @@
 # LeRobot v3 Dataset Augmentation Tool
 
-A CLI tool that augments [LeRobot v3](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets from Hugging Face Hub for robot learning.
+A CLI tool that augments [LeRobot v3](https://huggingface.co/docs/lerobot/lerobot-dataset-v3) datasets from Hugging Face for robot learning.
 
 ## What it does
 
@@ -17,6 +17,8 @@ v7 - https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2F
 v8 - https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_balanced_v8%2Fepisode_0
 
 v9 - https://huggingface.co/spaces/lerobot/visualize_dataset?path=%2Fjgiegold%2Faloha_balanced_v9%2Fepisode_0
+
+![](https://github.com/jonte1346/lerobot_aug/blob/main/sam3.gif)
 
 ## Setup
 
